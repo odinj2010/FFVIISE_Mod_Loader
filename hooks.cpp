@@ -176,16 +176,18 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, RGB(255, 0, 0)); // Red text
 
-            // Font setup
-            //Height (Size): The first argument 32 is the height in pixels. You can lower it (e.g., to 16 or 20) to make it smaller.
-            //Weight (Boldness): The fifth argument FW_BOLD makes it thick. You can change this to FW_NORMAL, FW_LIGHT, or FW_SEMIBOLD to alter the thickness.
-            //Italic / Underline / Strikeout: The sixth, seventh, and eighth arguments (FALSE, FALSE, FALSE) stand for: Italic, Underline, and Strikeout. Set any to TRUE to activate them (e.g., setting the first to TRUE makes it italicized).
-            //Color: In SetTextColor(hdc, RGB(255, 0, 0));, the RGB(255, 0, 0) is Red. You can change these values (from 0 to 255) to make it any color. E.g., RGB(255, 255, 255) for white, or RGB(0, 255, 0) for green.
-            //Font Family: The last argument "Arial" can be changed to any installed Windows system font, such as:
-            //"Segoe UI" (Standard clean Windows font)
-            //"Trebuchet MS" or "Verdana" (Modern looking)
-            //"Consolas" or "Courier New" (Retro/Terminal monospaced look)
-            //"Georgia" or "Times New Roman" (Serif look)
+            /* 
+            Font setup
+            Height (Size): The first argument 32 is the height in pixels. You can lower it (e.g., to 16 or 20) to make it smaller.
+            Weight (Boldness): The fifth argument FW_BOLD makes it thick. You can change this to FW_NORMAL, FW_LIGHT, or FW_SEMIBOLD to alter the thickness.
+            Italic / Underline / Strikeout: The sixth, seventh, and eighth arguments (FALSE, FALSE, FALSE) stand for: Italic, Underline, and Strikeout. Set any to TRUE to activate them (e.g., setting the first to TRUE makes it italicized).
+            Color: In SetTextColor(hdc, RGB(255, 0, 0));, the RGB(255, 0, 0) is Red. You can change these values (from 0 to 255) to make it any color. E.g., RGB(255, 255, 255) for white, or RGB(0, 255, 0) for green.
+            Font Family: The last argument "Arial" can be changed to any installed Windows system font, such as:
+            "Segoe UI" (Standard clean Windows font)
+            "Trebuchet MS" or "Verdana" (Modern looking)
+            "Consolas" or "Courier New" (Retro/Terminal monospaced look)
+            "Georgia" or "Times New Roman" (Serif look)
+            */
             HFONT hFont = CreateFontA(
                 16, 0, 0, 0, FW_LIGHT, TRUE, FALSE, FALSE,
                 ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
