@@ -189,13 +189,13 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             "Georgia" or "Times New Roman" (Serif look)
             */
             HFONT hFont = CreateFontA(
-                16, 0, 0, 0, FW_LIGHT, TRUE, FALSE, FALSE,
+                20, 0, 0, 0, FW_LIGHT, TRUE, FALSE, FALSE,
                 ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Verdana"
+                DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI"
             );
             HFONT oldFont = (HFONT)SelectObject(hdc, hFont);
 
-            const char* text = "FFVIISE File Loader Active - by NfgOdin";
+            const char* text = "FFVIISE Mod Loader Active - by NfgOdin";
             TextOutA(hdc, 25, 25, text, (int)strlen(text));
 
             SelectObject(hdc, oldFont);
@@ -440,6 +440,9 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
 // Configuration variables
 std::wstring g_ModsDirectory = L"mods";
 std::wstring g_PluginsDirectory = L"plugins";
+std::wstring g_SplashScreens = L"custom";
+std::wstring g_BaseDir = L"";
+std::vector<std::wstring> g_ActiveMods;
 bool g_EnableLogging = true;
 std::wstring g_LogFileName = L"mods_loader_log.txt";
 std::wstring g_LogPath = L"mods_loader_log.txt";
@@ -448,6 +451,24 @@ std::wstring g_IniPath = L"mods_loader.ini";
 bool DirectoryExists(const std::wstring& path) {
     DWORD dwAttrib = GetFileAttributesW(path.c_str());
     return (dwAttrib != INVALID_FILE_ATTRIBUTES && (dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+std::vector<std::wstring> GetSubdirectories(const std::wstring& dirPath) {
+    std::vector<std::wstring> subdirs;
+    std::wstring searchPath = dirPath + L"\\*";
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                wcscmp(fd.cFileName, L".") != 0 &&
+                wcscmp(fd.cFileName, L"..") != 0) {
+                subdirs.push_back(fd.cFileName);
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+    return subdirs;
 }
 
 struct FileInfo {
@@ -500,6 +521,7 @@ struct LgpEntry {
     std::wstring diskName;
     DWORD dataStart; // Offset of the DATA-ENTRY_HEADER in the LGP
     DWORD size;      // Size of the raw file data
+    std::wstring modFolder; // Name of the mod folder this entry resides in
 };
 
 struct RedirectState {
@@ -546,27 +568,53 @@ int FilenameToLookupIndex(const std::string& filename) {
     return lv1 * 30 + lv2 + 1; // Returns index 1 to 900
 }
 
-void PopulateVirtualLgp(const std::wstring& archiveFolder, RedirectState& state) {
-    Log("[Loader] PopulateVirtualLgp started for folder: %S\n", archiveFolder.c_str());
-    std::vector<FileInfo> files = GetFilesInDirectory(archiveFolder);
+void PopulateVirtualLgp(const std::wstring& archiveRelPath, RedirectState& state) {
+    Log("[Loader] PopulateVirtualLgp started for rel path: %S\n", archiveRelPath.c_str());
     
-    DWORD numFiles = (DWORD)files.size();
-    Log("[Loader] PopulateVirtualLgp: Found %d files in folder.\n", numFiles);
+    struct MergedFileInfo {
+        std::wstring diskName;
+        DWORD size;
+        std::wstring modFolder;
+    };
+    std::unordered_map<std::wstring, MergedFileInfo> mergedFiles;
+    
+    // Scan in reverse order (lowest priority first) so higher priority overrides them
+    for (auto it = g_ActiveMods.rbegin(); it != g_ActiveMods.rend(); ++it) {
+        std::wstring modFolder = *it;
+        std::wstring archiveFolder = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\" + archiveRelPath;
+        if (DirectoryExists(archiveFolder)) {
+            std::vector<FileInfo> files = GetFilesInDirectory(archiveFolder);
+            for (const auto& file : files) {
+                std::wstring lowerName = file.name;
+                std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+                
+                MergedFileInfo info;
+                info.diskName = file.name;
+                info.size = file.size;
+                info.modFolder = modFolder;
+                mergedFiles[lowerName] = info;
+            }
+        }
+    }
+    
+    DWORD numFiles = (DWORD)mergedFiles.size();
+    Log("[Loader] PopulateVirtualLgp: Found %d merged files across mods.\n", numFiles);
 
     state.isVirtualLgp = true;
     state.entries.resize(numFiles);
 
-    // Initialize entries with diskName, lowercase LGP name, and size
-    for (DWORD i = 0; i < numFiles; ++i) {
-        std::wstring wName = files[i].name;
+    // Initialize entries
+    DWORD idx = 0;
+    for (const auto& pair : mergedFiles) {
+        std::wstring wName = pair.first;
         std::string name(wName.begin(), wName.end());
-        std::transform(name.begin(), name.end(), name.begin(), ::tolower);
 
         LgpEntry entry;
         entry.name = name;
-        entry.diskName = files[i].name;
-        entry.size = files[i].size;
-        state.entries[i] = entry;
+        entry.diskName = pair.second.diskName;
+        entry.size = pair.second.size;
+        entry.modFolder = pair.second.modFolder;
+        state.entries[idx++] = entry;
     }
 
     // Sort entries by hash index ascending, and alphabetically within the same hash bucket
@@ -613,11 +661,11 @@ void PopulateVirtualLgp(const std::wstring& archiveFolder, RedirectState& state)
     std::vector<unsigned short> lookupCount(900, 0);
     
     for (DWORD i = 0; i < numFiles; ++i) {
-        int idx = FilenameToLookupIndex(state.entries[i].name); // 1-based index (1 to 900)
-        if (idx >= 0 && idx < 900) {
-            lookupCount[idx]++;
-            if (lookupIndex[idx] == 0) {
-                lookupIndex[idx] = (unsigned short)(i + 1); // 1-based TOC index
+        int indexVal = FilenameToLookupIndex(state.entries[i].name); // 1-based index (1 to 900)
+        if (indexVal >= 0 && indexVal < 900) {
+            lookupCount[indexVal]++;
+            if (lookupIndex[indexVal] == 0) {
+                lookupIndex[indexVal] = (unsigned short)(i + 1); // 1-based TOC index
             }
         }
     }
@@ -672,10 +720,61 @@ ungetc_t OriginalUngetc = nullptr;
 _fileno_t OriginalFileno = nullptr;
 fflush_t OriginalFflush = nullptr;
 
+// Original Win32 Function Pointers
+typedef HANDLE(WINAPI* CreateFileW_t)(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile
+);
+CreateFileW_t OriginalCreateFileW = nullptr;
+
 // Helper to check if a file exists
 bool FileExists(const std::wstring& path) {
     DWORD dwAttrib = GetFileAttributesW(path.c_str());
     return (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+// Extract embedded RCDATA resource to a temporary file
+std::wstring ExtractResourceToTempFile(int resourceID, const std::wstring& suffix) {
+    HMODULE hMod = NULL;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&ExtractResourceToTempFile, &hMod);
+    if (!hMod) {
+        hMod = GetModuleHandleA("d3d11.dll");
+    }
+    HRSRC hRes = FindResourceW(hMod, MAKEINTRESOURCEW(resourceID), MAKEINTRESOURCEW(10));
+    if (!hRes) {
+        Log("[Loader] ERROR: FindResourceW failed for ID %d\n", resourceID);
+        return L"";
+    }
+
+    HGLOBAL hGlob = LoadResource(hMod, hRes);
+    DWORD size = SizeofResource(hMod, hRes);
+    void* pData = LockResource(hGlob);
+    if (!pData) {
+        Log("[Loader] ERROR: LockResource failed for ID %d\n", resourceID);
+        return L"";
+    }
+
+    wchar_t tempDir[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempDir);
+    std::wstring tempFilePath = std::wstring(tempDir) + L"ffviise_temp_" + suffix;
+
+    HANDLE hFile = CreateFileW(tempFilePath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD bytesWritten = 0;
+        WriteFile(hFile, pData, size, &bytesWritten, NULL);
+        CloseHandle(hFile);
+        Log("[Loader] Successfully extracted resource %d to temp file: %S (%d bytes)\n", resourceID, tempFilePath.c_str(), size);
+        return tempFilePath;
+    } else {
+        Log("[Loader] ERROR: CreateFileW failed for temp file: %S. Error: %d\n", tempFilePath.c_str(), GetLastError());
+    }
+    return L"";
 }
 
 // Forward declarations of Hooked APIs
@@ -695,6 +794,15 @@ int HookedUngetc(int c, FILE* stream);
 int HookedFileno(FILE* stream);
 int HookedFflush(FILE* stream);
 void HookedClearerr(FILE* stream);
+HANDLE WINAPI HookedCreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile
+);
 
 void LoadConfiguration() {
     wchar_t exePath[MAX_PATH];
@@ -702,6 +810,7 @@ void LoadConfiguration() {
     std::wstring exeStr = exePath;
     size_t exeSlash = exeStr.rfind(L'\\');
     std::wstring iniPath = (exeSlash != std::wstring::npos) ? exeStr.substr(0, exeSlash) + L"\\mods_loader.ini" : L"mods_loader.ini";
+    g_BaseDir = (exeSlash != std::wstring::npos) ? exeStr.substr(0, exeSlash) : L"";
 
     // Read EnableLogging (true/false)
     wchar_t loggingStr[32] = L"true";
@@ -720,6 +829,12 @@ void LoadConfiguration() {
     GetPrivateProfileStringW(L"Loader", L"PluginsDirectory", L"plugins", pluginsDir, MAX_PATH, iniPath.c_str());
     g_PluginsDirectory = pluginsDir;
 
+    // Read SplashScreens (default/custom/mods)
+    wchar_t splashScreens[32] = L"custom";
+    GetPrivateProfileStringW(L"Loader", L"SplashScreens", L"custom", splashScreens, 32, iniPath.c_str());
+    g_SplashScreens = splashScreens;
+    std::transform(g_SplashScreens.begin(), g_SplashScreens.end(), g_SplashScreens.begin(), ::towlower);
+
     // Read LogFile
     wchar_t logFile[MAX_PATH] = L"mods_loader_log.txt";
     GetPrivateProfileStringW(L"Loader", L"LogFile", L"mods_loader_log.txt", logFile, MAX_PATH, iniPath.c_str());
@@ -728,6 +843,108 @@ void LoadConfiguration() {
     // Resolve absolute log path
     g_LogPath = (exeSlash != std::wstring::npos) ? exeStr.substr(0, exeSlash) + L"\\" + g_LogFileName : g_LogFileName;
     g_IniPath = iniPath;
+
+    // Load active mods order
+    void LoadModsLoadOrder();
+    LoadModsLoadOrder();
+}
+
+void LoadModsLoadOrder() {
+    g_ActiveMods.clear();
+    std::wstring modsPath = g_BaseDir + L"\\" + g_ModsDirectory;
+    if (!DirectoryExists(modsPath)) {
+        Log("[Loader] Mods directory does not exist: %S\n", modsPath.c_str());
+        return;
+    }
+
+    std::wstring loadOrderFilePath = modsPath + L"\\load_order.txt";
+    std::vector<std::wstring> discovered = GetSubdirectories(modsPath);
+    
+    if (!FileExists(loadOrderFilePath)) {
+        Log("[Loader] load_order.txt not found. Creating and populating in alphabetical order...\n");
+        // Sort discovered subdirectories alphabetically
+        std::sort(discovered.begin(), discovered.end());
+        
+        FILE* f = NULL;
+        _wfopen_s(&f, loadOrderFilePath.c_str(), L"w, ccs=UTF-8");
+        if (f) {
+            for (const auto& mod : discovered) {
+                fwprintf(f, L"%s\n", mod.c_str());
+                g_ActiveMods.push_back(mod);
+                Log("[Loader] Discovered and auto-added mod to load order: %S\n", mod.c_str());
+            }
+            fclose(f);
+        }
+    } else {
+        Log("[Loader] Reading load order from: %S\n", loadOrderFilePath.c_str());
+        FILE* f = NULL;
+        _wfopen_s(&f, loadOrderFilePath.c_str(), L"r, ccs=UTF-8");
+        if (!f) {
+            _wfopen_s(&f, loadOrderFilePath.c_str(), L"r, ccs=UNICODE");
+        }
+        if (!f) {
+            _wfopen_s(&f, loadOrderFilePath.c_str(), L"r"); // fallback to ANSI
+        }
+        
+        std::vector<std::wstring> existingMods;
+        if (f) {
+            wchar_t line[MAX_PATH];
+            while (fgetws(line, MAX_PATH, f)) {
+                std::wstring modName = line;
+                // Trim whitespace and newlines
+                modName.erase(modName.find_last_not_of(L" \t\r\n") + 1);
+                modName.erase(0, modName.find_first_not_of(L" \t\r\n"));
+                
+                if (!modName.empty() && modName[0] != L';') { // allow comments starting with ';'
+                    std::wstring fullModPath = modsPath + L"\\" + modName;
+                    if (DirectoryExists(fullModPath)) {
+                        existingMods.push_back(modName);
+                        g_ActiveMods.push_back(modName);
+                        Log("[Loader] Active mod loaded: %S\n", modName.c_str());
+                    } else {
+                        Log("[Loader] WARNING: Mod folder specified in load_order.txt does not exist: %S\n", modName.c_str());
+                    }
+                }
+            }
+            fclose(f);
+        }
+        
+        // Find new mods that are not in the existing load_order.txt list
+        std::vector<std::wstring> newMods;
+        for (const auto& discMod : discovered) {
+            bool found = false;
+            for (const auto& existMod : existingMods) {
+                if (_wcsicmp(discMod.c_str(), existMod.c_str()) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                newMods.push_back(discMod);
+            }
+        }
+        
+        if (!newMods.empty()) {
+            std::sort(newMods.begin(), newMods.end());
+            Log("[Loader] Found %d new mods not in load_order.txt. Appending to bottom...\n", (int)newMods.size());
+            
+            // Re-open in append mode
+            FILE* fAppend = NULL;
+            _wfopen_s(&fAppend, loadOrderFilePath.c_str(), L"a, ccs=UTF-8");
+            if (!fAppend) {
+                _wfopen_s(&fAppend, loadOrderFilePath.c_str(), L"a");
+            }
+            
+            if (fAppend) {
+                for (const auto& mod : newMods) {
+                    fwprintf(fAppend, L"%s\n", mod.c_str());
+                    g_ActiveMods.push_back(mod);
+                    Log("[Loader] Appended new mod to load order: %S\n", mod.c_str());
+                }
+                fclose(fAppend);
+            }
+        }
+    }
 }
 
 void GetModuleAndOffset(void* address, wchar_t* outModuleName, DWORD& outOffset) {
@@ -878,6 +1095,17 @@ void LoadPlugins() {
 
 void InitializeHooks() {
     LoadConfiguration();
+    
+    // Clear/Truncate the log file at startup
+    if (g_EnableLogging) {
+        FILE* f = NULL;
+        _wfopen_s(&f, g_LogPath.c_str(), L"w");
+        if (f) {
+            fprintf(f, "[Loader] === Log Initialized (Fresh Start) ===\n");
+            fclose(f);
+        }
+    }
+
     Log("[Loader] Initializing hooks via MinHook...\n");
     SetUnhandledExceptionFilter(CrashHandler);
 
@@ -925,6 +1153,23 @@ void InitializeHooks() {
         if (targetUngetc) MH_CreateHook(targetUngetc, (LPVOID)&HookedUngetc, (LPVOID*)&OriginalUngetc);
         if (targetFileno) MH_CreateHook(targetFileno, (LPVOID)&HookedFileno, (LPVOID*)&OriginalFileno);
         if (targetFflush) MH_CreateHook(targetFflush, (LPVOID)&HookedFflush, (LPVOID*)&OriginalFflush);
+
+        // Hook Win32 CreateFileW to intercept native file openings
+        HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
+        if (!hKernelBase) {
+            hKernelBase = GetModuleHandleW(L"kernel32.dll");
+        }
+        if (hKernelBase) {
+            void* pCreateFileW = (void*)GetProcAddress(hKernelBase, "CreateFileW");
+            if (pCreateFileW) {
+                MH_STATUS status = MH_CreateHook(pCreateFileW, (LPVOID)&HookedCreateFileW, (LPVOID*)&OriginalCreateFileW);
+                if (status == MH_OK) {
+                    Log("[Loader] Hooked Win32 CreateFileW successfully!\n");
+                } else {
+                    Log("[Loader] Failed to hook Win32 CreateFileW. Status: %d\n", status);
+                }
+            }
+        }
 
         // Hook D3D11CreateDeviceAndSwapChain to intercept the game's actual SwapChain creation
         Log("[Loader] Hooking D3D11CreateDeviceAndSwapChain...\n");
@@ -1003,6 +1248,81 @@ void ParseLgpTOC(FILE* f, RedirectState& state) {
     }
 }
 
+std::wstring GetFilenameFromPath(const std::wstring& path) {
+    size_t lastSlash = path.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) {
+        return path.substr(lastSlash + 1);
+    }
+    return path;
+}
+
+std::wstring ResolveModPath(const std::wstring& relativePath) {
+    if (relativePath.empty()) return L"";
+    for (const auto& modFolder : g_ActiveMods) {
+        std::wstring checkPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\" + relativePath;
+        if (FileExists(checkPath)) {
+            return checkPath;
+        }
+    }
+    return L"";
+}
+
+std::wstring ResolveModDirectoryPath(const std::wstring& relativePath) {
+    if (relativePath.empty()) return L"";
+    for (const auto& modFolder : g_ActiveMods) {
+        std::wstring checkPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\" + relativePath;
+        if (DirectoryExists(checkPath)) {
+            return checkPath;
+        }
+    }
+    return L"";
+}
+
+std::wstring GetSplashOverridePath(const std::wstring& pathStr, const std::wstring& originalPath, int resourceID, const std::wstring& tempSuffix) {
+    if (g_SplashScreens == L"custom") {
+        // Always load custom built-in resource directly
+        std::wstring tempFile = ExtractResourceToTempFile(resourceID, tempSuffix);
+        if (!tempFile.empty()) {
+            Log("[Loader] Splash redirection using custom embedded resource: %S\n", tempFile.c_str());
+            return tempFile;
+        }
+        return L"";
+    }
+
+    // Otherwise, SplashScreens == "default". Check mods folder first
+    std::wstring filename = GetFilenameFromPath(originalPath);
+    
+    // Try to find relative path from base directory
+    std::wstring relativePath = L"";
+    if (!g_BaseDir.empty() && originalPath.size() > g_BaseDir.size() &&
+        _wcsnicmp(originalPath.c_str(), g_BaseDir.c_str(), g_BaseDir.size()) == 0) {
+        relativePath = originalPath.substr(g_BaseDir.size());
+        if (!relativePath.empty() && (relativePath[0] == L'\\' || relativePath[0] == L'/')) {
+            relativePath = relativePath.substr(1);
+        }
+    }
+    
+    // 1. Check mirrored path in mods: mods/relative_path
+    if (!relativePath.empty()) {
+        std::wstring mirrorPath = ResolveModPath(relativePath);
+        if (!mirrorPath.empty()) {
+            Log("[Loader] Splash redirection found in mods (mirrored): %S\n", mirrorPath.c_str());
+            return mirrorPath;
+        }
+    }
+    
+    // 2. Check flat path in mods: mods/filename
+    std::wstring flatPath = ResolveModPath(filename);
+    if (!flatPath.empty()) {
+        Log("[Loader] Splash redirection found in mods (flat): %S\n", flatPath.c_str());
+        return flatPath;
+    }
+    
+    // If not found in mods folder, fall back to default game image (no redirection)
+    Log("[Loader] Splash override not found in mods folder. Using default game image: %S\n", originalPath.c_str());
+    return L"";
+}
+
 // Hooked fopen
 FILE* HookedFopen(const char* filename, const char* mode) {
     if (filename) {
@@ -1017,10 +1337,28 @@ FILE* HookedFopen(const char* filename, const char* mode) {
             std::wstring originalPath = pathStr;
             std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
 
+            std::wstring splashOverride = L"";
+            if (pathStr.find(L"dotemu-logo.png") != std::wstring::npos) {
+                splashOverride = GetSplashOverridePath(pathStr, originalPath, 101, L"dotemu.png");
+            } else if (pathStr.find(L"finelogo.png") != std::wstring::npos) {
+                splashOverride = GetSplashOverridePath(pathStr, originalPath, 102, L"finelogo.png");
+            } else if (pathStr.find(L"press_start.png") != std::wstring::npos) {
+                splashOverride = GetSplashOverridePath(pathStr, originalPath, 103, L"press_start.png");
+            }
+
+            if (!splashOverride.empty()) {
+                char cTempFile[MAX_PATH];
+                size_t wConverted = 0;
+                wcstombs_s(&wConverted, cTempFile, splashOverride.c_str(), MAX_PATH);
+                Log("[Loader] Redirecting fopen: %s -> %s\n", filename, cTempFile);
+                return OriginalFopen(cTempFile, mode);
+            }
+
             size_t dataPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
             if (dataPos != std::wstring::npos) {
-                std::wstring overridePath = originalPath.substr(0, dataPos) + L"\\" + g_ModsDirectory + L"\\" + originalPath.substr(dataPos + 21);
-                if (FileExists(overridePath)) {
+                std::wstring relPath = originalPath.substr(dataPos + 21);
+                std::wstring overridePath = ResolveModPath(relPath);
+                if (!overridePath.empty()) {
                     char cOverridePath[MAX_PATH];
                     size_t wConverted = 0;
                     wcstombs_s(&wConverted, cOverridePath, overridePath.c_str(), MAX_PATH);
@@ -1070,13 +1408,13 @@ FILE* HookedFopen(const char* filename, const char* mode) {
                     if (exeSlash != std::wstring::npos) gameDir = exeStr.substr(0, exeSlash);
                 }
 
-                std::wstring archiveFolder = gameDir + L"\\" + g_ModsDirectory + L"\\" + archiveRelPath;
-                if (DirectoryExists(archiveFolder)) {
+                std::wstring archiveFolder = ResolveModDirectoryPath(archiveRelPath);
+                if (!archiveFolder.empty()) {
                     std::lock_guard<std::recursive_mutex> lock(g_Mutex);
                     RedirectState state;
                     state.archivePath = baseDir;
                     state.isLgp = true;
-                    PopulateVirtualLgp(archiveFolder, state);
+                    PopulateVirtualLgp(archiveRelPath, state);
                     
                     DWORD totalVirtualSize = (DWORD)state.virtualArchiveData.size();
                     for (const auto& entry : state.entries) {
@@ -1176,10 +1514,25 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
             std::wstring originalPath = pathStr;
             std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
 
+            std::wstring splashOverride = L"";
+            if (pathStr.find(L"dotemu-logo.png") != std::wstring::npos) {
+                splashOverride = GetSplashOverridePath(pathStr, originalPath, 101, L"dotemu.png");
+            } else if (pathStr.find(L"finelogo.png") != std::wstring::npos) {
+                splashOverride = GetSplashOverridePath(pathStr, originalPath, 102, L"finelogo.png");
+            } else if (pathStr.find(L"press_start.png") != std::wstring::npos) {
+                splashOverride = GetSplashOverridePath(pathStr, originalPath, 103, L"press_start.png");
+            }
+
+            if (!splashOverride.empty()) {
+                Log("[Loader] Redirecting _wfopen: %S -> %S\n", filename, splashOverride.c_str());
+                return OriginalWfopen(splashOverride.c_str(), mode);
+            }
+
             size_t dataPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
             if (dataPos != std::wstring::npos) {
-                std::wstring overridePath = originalPath.substr(0, dataPos) + L"\\" + g_ModsDirectory + L"\\" + originalPath.substr(dataPos + 21);
-                if (FileExists(overridePath)) {
+                std::wstring relPath = originalPath.substr(dataPos + 21);
+                std::wstring overridePath = ResolveModPath(relPath);
+                if (!overridePath.empty()) {
                     Log("[Loader] Redirecting _wfopen: %S -> %S\n", filename, overridePath.c_str());
                     return OriginalWfopen(overridePath.c_str(), mode);
                 }
@@ -1221,13 +1574,13 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
                     if (exeSlash != std::wstring::npos) gameDir = exeStr.substr(0, exeSlash);
                 }
 
-                std::wstring archiveFolder = gameDir + L"\\" + g_ModsDirectory + L"\\" + archiveRelPath;
-                if (DirectoryExists(archiveFolder)) {
+                std::wstring archiveFolder = ResolveModDirectoryPath(archiveRelPath);
+                if (!archiveFolder.empty()) {
                     std::lock_guard<std::recursive_mutex> lock(g_Mutex);
                     RedirectState state;
                     state.archivePath = baseDir;
                     state.isLgp = true;
-                    PopulateVirtualLgp(archiveFolder, state);
+                    PopulateVirtualLgp(archiveRelPath, state);
                     
                     DWORD totalVirtualSize = (DWORD)state.virtualArchiveData.size();
                     for (const auto& entry : state.entries) {
@@ -1312,6 +1665,78 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
     return f;
 }
 
+HANDLE WINAPI HookedCreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile
+) {
+    if (lpFileName) {
+        wchar_t absPath[MAX_PATH];
+        if (GetFullPathNameW(lpFileName, MAX_PATH, absPath, NULL) != 0) {
+            std::wstring pathStr = absPath;
+            std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
+            std::wstring originalPath = pathStr;
+            std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
+
+            // 1. Splash screen overrides
+            std::wstring splashOverride = L"";
+            if (pathStr.find(L"dotemu-logo.png") != std::wstring::npos) {
+                splashOverride = GetSplashOverridePath(pathStr, originalPath, 101, L"dotemu.png");
+            } else if (pathStr.find(L"finelogo.png") != std::wstring::npos) {
+                splashOverride = GetSplashOverridePath(pathStr, originalPath, 102, L"finelogo.png");
+            } else if (pathStr.find(L"press_start.png") != std::wstring::npos) {
+                splashOverride = GetSplashOverridePath(pathStr, originalPath, 103, L"press_start.png");
+            }
+
+            if (!splashOverride.empty()) {
+                Log("[Loader] Redirecting CreateFileW (Splash): %S -> %S\n", lpFileName, splashOverride.c_str());
+                return OriginalCreateFileW(
+                    splashOverride.c_str(),
+                    dwDesiredAccess,
+                    dwShareMode,
+                    lpSecurityAttributes,
+                    dwCreationDisposition,
+                    dwFlagsAndAttributes,
+                    hTemplateFile
+                );
+            }
+
+            // 2. Loose file overrides (excluding LGP archives which we virtualization-hook inside fopen/wfopen)
+            size_t dataPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
+            if (dataPos != std::wstring::npos && pathStr.find(L".lgp") == std::wstring::npos) {
+                std::wstring relPath = originalPath.substr(dataPos + 21);
+                std::wstring overridePath = ResolveModPath(relPath);
+                if (!overridePath.empty()) {
+                    Log("[Loader] Redirecting CreateFileW: %S -> %S\n", lpFileName, overridePath.c_str());
+                    return OriginalCreateFileW(
+                        overridePath.c_str(),
+                        dwDesiredAccess,
+                        dwShareMode,
+                        lpSecurityAttributes,
+                        dwCreationDisposition,
+                        dwFlagsAndAttributes,
+                        hTemplateFile
+                    );
+                }
+            }
+        }
+    }
+
+    return OriginalCreateFileW(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile
+    );
+}
+
 
 void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
     state.virtualFileOffset = targetOffset;
@@ -1348,9 +1773,14 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
             size_t dotPos = archiveRelPath.rfind(L'.');
             if (dotPos != std::wstring::npos) archiveRelPath = archiveRelPath.substr(0, dotPos);
 
-            std::wstring overridePath = gameDir + L"\\" + g_ModsDirectory + L"\\" + archiveRelPath + L"\\" + entry.diskName;
+            std::wstring overridePath = L"";
+            if (state.isVirtualLgp) {
+                overridePath = gameDir + L"\\" + g_ModsDirectory + L"\\" + entry.modFolder + L"\\" + archiveRelPath + L"\\" + entry.diskName;
+            } else {
+                overridePath = ResolveModPath(archiveRelPath + L"\\" + entry.diskName);
+            }
             
-            if (state.isVirtualLgp || FileExists(overridePath)) {
+            if (!overridePath.empty()) {
                 state.isRedirecting = true;
                 state.overrideFilePath = overridePath;
                 

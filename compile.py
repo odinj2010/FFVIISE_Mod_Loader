@@ -52,10 +52,22 @@ def compile_dll():
             print("="*80 + "\n")
             
         print("Found MSVC (cl). Compiling...")
+        
+        # Compile resource file
+        print("Compiling resources (resources.rc)...")
+        rc_cmd = ["rc.exe", "resources.rc"]
+        rc_res = subprocess.run(rc_cmd, capture_output=True, text=True)
+        if rc_res.returncode != 0:
+            print("Resource compilation failed:")
+            print(rc_res.stdout)
+            print(rc_res.stderr)
+            return False
+            
         cmd = [
             "cl.exe", "/LD", "/O2", "d3d11_proxy.cpp", "hooks.cpp",
             "minhook/src/buffer.c", "minhook/src/hook.c", "minhook/src/trampoline.c",
             "minhook/src/hde/hde32.c", "minhook/src/hde/hde64.c",
+            "resources.res",
             "/Iminhook/include",
             "/link", "/out:d3d11.dll", "user32.lib", "kernel32.lib", "gdi32.lib", "d3d11.lib", "d2d1.lib", "dwrite.lib"
         ]
