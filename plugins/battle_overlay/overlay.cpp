@@ -8,6 +8,8 @@ HWND g_hOverlayWnd = nullptr;
 HANDLE g_hOverlayThread = nullptr;
 bool g_OverlayRunning = false;
 HWND g_hGameWnd = nullptr;
+bool g_ShowOverlay = true;
+
 
 // Forward declaration of WndProc
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -267,6 +269,22 @@ DWORD WINAPI OverlayThread(LPVOID lpParam) {
 
     MSG msg;
     while (g_OverlayRunning) {
+        // Check for toggle hotkey: Ctrl + Insert when game is in foreground
+        if (GetForegroundWindow() == g_hGameWnd) {
+            static bool wasKeyDown = false;
+            bool isCtrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool isInsertDown = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+            if (isCtrlDown && isInsertDown) {
+                if (!wasKeyDown) {
+                    g_ShowOverlay = !g_ShowOverlay;
+                    ShowWindow(g_hOverlayWnd, g_ShowOverlay ? SW_SHOW : SW_HIDE);
+                    wasKeyDown = true;
+                }
+            } else {
+                wasKeyDown = false;
+            }
+        }
+
         // Track the game window size and position
         if (IsWindow(g_hGameWnd)) {
             RECT gameRect;

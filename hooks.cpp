@@ -45,6 +45,7 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
 bool g_D3D11HookInitialized = false;
 ULONGLONG g_StartTickCount = 0;
 bool g_OverlayEnabled = true;
+extern std::vector<std::wstring> g_ActiveMods;
 
 // Direct2D/DirectWrite rendering resources
 ID2D1Factory* g_pD2DFactory = nullptr;
@@ -197,6 +198,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 
             const char* text = "FFVIISE Mod Loader Active - by NfgOdin";
             TextOutA(hdc, 25, 25, text, (int)strlen(text));
+
+            char modsText[128];
+            snprintf(modsText, sizeof(modsText), "Active Mods Loaded: %zu", g_ActiveMods.size());
+            TextOutA(hdc, 25, 50, modsText, (int)strlen(modsText));
 
             SelectObject(hdc, oldFont);
             DeleteObject(hFont);
