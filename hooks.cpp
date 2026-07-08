@@ -733,6 +733,65 @@ bool FileExists(const std::wstring& path) {
     return (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
 }
 
+std::wstring AnsiToWide(const std::string& str) {
+    if (str.empty()) return L"";
+    int size_needed = MultiByteToWideChar(CP_ACP, 0, str.c_str(), (int)str.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_ACP, 0, str.c_str(), (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
+}
+
+std::string WideToAnsi(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    int size_needed = WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+    return strTo;
+}
+
+std::wstring GetFullPathSafe(const std::wstring& path) {
+    wchar_t absPath[4096];
+    DWORD res = GetFullPathNameW(path.c_str(), 4096, absPath, NULL);
+    if (res > 0 && res < 4096) {
+        return std::wstring(absPath, res);
+    }
+    if (res >= 4096) {
+        std::vector<wchar_t> buffer(res + 1);
+        DWORD res2 = GetFullPathNameW(path.c_str(), (DWORD)buffer.size(), buffer.data(), NULL);
+        if (res2 > 0 && res2 < buffer.size()) {
+            return std::wstring(buffer.data(), res2);
+        }
+    }
+    return path;
+}
+
+bool ContainsKeywordAnsi(const char* str) {
+    if (!str) return false;
+    std::string s = str;
+    for (char& c : s) {
+        if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
+    }
+    return (s.find("ff7") != std::string::npos ||
+            s.find("workingdir") != std::string::npos ||
+            s.find(".lgp") != std::string::npos ||
+            s.find("logo") != std::string::npos ||
+            s.find("start") != std::string::npos);
+}
+
+bool ContainsKeywordWide(const wchar_t* str) {
+    if (!str) return false;
+    std::wstring s = str;
+    for (wchar_t& c : s) {
+        if (c >= L'A' && c <= L'Z') c += (L'a' - L'A');
+    }
+    return (s.find(L"ff7") != std::wstring::npos ||
+            s.find(L"workingdir") != std::wstring::npos ||
+            s.find(L".lgp") != std::wstring::npos ||
+            s.find(L"logo") != std::wstring::npos ||
+            s.find(L"start") != std::wstring::npos);
+}
+
+
 // Extract embedded RCDATA resource to a temporary file
 std::wstring ExtractResourceToTempFile(int resourceID, const std::wstring& suffix) {
     HMODULE hMod = NULL;
@@ -1295,13 +1354,14 @@ std::wstring GetSplashOverridePath(const std::wstring& pathStr, const std::wstri
 
 // Hooked fopen
 FILE* HookedFopen(const char* filename, const char* mode) {
-    if (filename) {
-        wchar_t wFilename[MAX_PATH];
-        size_t convertedChars = 0;
-        mbstowcs_s(&convertedChars, wFilename, filename, MAX_PATH);
+    if (filename && !ContainsKeywordAnsi(filename)) {
+        return OriginalFopen(filename, mode);
+    }
 
-        wchar_t absPath[MAX_PATH];
-        if (GetFullPathNameW(wFilename, MAX_PATH, absPath, NULL) != 0) {
+    if (filename) {
+        std::wstring wFilename = AnsiToWide(filename);
+        std::wstring absPath = GetFullPathSafe(wFilename);
+        if (!absPath.empty()) {
             std::wstring pathStr = absPath;
             std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
             std::wstring originalPath = pathStr;
@@ -1317,11 +1377,11 @@ FILE* HookedFopen(const char* filename, const char* mode) {
             }
 
             if (!splashOverride.empty()) {
-                char cTempFile[MAX_PATH];
-                size_t wConverted = 0;
-                wcstombs_s(&wConverted, cTempFile, splashOverride.c_str(), MAX_PATH);
-                Log("[Loader] Redirecting fopen: %s -> %s\n", filename, cTempFile);
-                return OriginalFopen(cTempFile, mode);
+                std::string cTempFile = WideToAnsi(splashOverride);
+                Log("[Loader] Redirecting fopen: %s -> %s\n", filename, cTempFile.c_str());
+                FILE* fRedirect = OriginalFopen(cTempFile.c_str(), mode);
+                Log("[Loader] Redirecting fopen returned: %p\n", fRedirect);
+                return fRedirect;
             }
 
             size_t dataPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
@@ -1329,12 +1389,11 @@ FILE* HookedFopen(const char* filename, const char* mode) {
                 std::wstring relPath = originalPath.substr(dataPos + 21);
                 std::wstring overridePath = ResolveModPath(relPath);
                 if (!overridePath.empty()) {
-                    char cOverridePath[MAX_PATH];
-                    size_t wConverted = 0;
-                    wcstombs_s(&wConverted, cOverridePath, overridePath.c_str(), MAX_PATH);
-                    
-                    Log("[Loader] Redirecting fopen: %s -> %s\n", filename, cOverridePath);
-                    return OriginalFopen(cOverridePath, mode);
+                    std::string cOverridePath = WideToAnsi(overridePath);
+                    Log("[Loader] Redirecting fopen: %s -> %s\n", filename, cOverridePath.c_str());
+                    FILE* fRedirect = OriginalFopen(cOverridePath.c_str(), mode);
+                    Log("[Loader] Redirecting fopen returned: %p\n", fRedirect);
+                    return fRedirect;
                 }
             }
         }
@@ -1347,12 +1406,9 @@ FILE* HookedFopen(const char* filename, const char* mode) {
         std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::tolower);
 
         if (pathStr.find(".lgp") != std::string::npos) {
-            wchar_t wFilename[MAX_PATH];
-            size_t convertedChars = 0;
-            mbstowcs_s(&convertedChars, wFilename, filename, MAX_PATH);
-
-            wchar_t absPath[MAX_PATH];
-            if (GetFullPathNameW(wFilename, MAX_PATH, absPath, NULL) != 0) {
+            std::wstring wFilename = AnsiToWide(filename);
+            std::wstring absPath = GetFullPathSafe(wFilename);
+            if (!absPath.empty()) {
                 std::wstring baseDir = absPath;
                 std::replace(baseDir.begin(), baseDir.end(), L'/', L'\\');
                 std::wstring archiveRelPath = L"";
@@ -1444,12 +1500,9 @@ FILE* HookedFopen(const char* filename, const char* mode) {
     }
 
     if (f && filename) {
-        wchar_t wFilename[MAX_PATH];
-        size_t convertedChars = 0;
-        mbstowcs_s(&convertedChars, wFilename, filename, MAX_PATH);
-
-        wchar_t absPath[MAX_PATH];
-        if (GetFullPathNameW(wFilename, MAX_PATH, absPath, NULL) != 0) {
+        std::wstring wFilename = AnsiToWide(filename);
+        std::wstring absPath = GetFullPathSafe(wFilename);
+        if (!absPath.empty()) {
             std::wstring pathStr = absPath;
             std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
             std::wstring originalPath = pathStr;
@@ -1476,9 +1529,13 @@ FILE* HookedFopen(const char* filename, const char* mode) {
 
 // Hooked _wfopen
 FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
+    if (filename && !ContainsKeywordWide(filename)) {
+        return OriginalWfopen(filename, mode);
+    }
+
     if (filename) {
-        wchar_t absPath[MAX_PATH];
-        if (GetFullPathNameW(filename, MAX_PATH, absPath, NULL) != 0) {
+        std::wstring absPath = GetFullPathSafe(filename);
+        if (!absPath.empty()) {
             std::wstring pathStr = absPath;
             std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
             std::wstring originalPath = pathStr;
@@ -1495,7 +1552,9 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
 
             if (!splashOverride.empty()) {
                 Log("[Loader] Redirecting _wfopen: %S -> %S\n", filename, splashOverride.c_str());
-                return OriginalWfopen(splashOverride.c_str(), mode);
+                FILE* fRedirect = OriginalWfopen(splashOverride.c_str(), mode);
+                Log("[Loader] Redirecting _wfopen returned: %p\n", fRedirect);
+                return fRedirect;
             }
 
             size_t dataPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
@@ -1504,7 +1563,9 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
                 std::wstring overridePath = ResolveModPath(relPath);
                 if (!overridePath.empty()) {
                     Log("[Loader] Redirecting _wfopen: %S -> %S\n", filename, overridePath.c_str());
-                    return OriginalWfopen(overridePath.c_str(), mode);
+                    FILE* fRedirect = OriginalWfopen(overridePath.c_str(), mode);
+                    Log("[Loader] Redirecting _wfopen returned: %p\n", fRedirect);
+                    return fRedirect;
                 }
             }
         }
@@ -1517,8 +1578,8 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
         std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
 
         if (pathStr.find(L".lgp") != std::wstring::npos) {
-            wchar_t absPath[MAX_PATH];
-            if (GetFullPathNameW(filename, MAX_PATH, absPath, NULL) != 0) {
+            std::wstring absPath = GetFullPathSafe(filename);
+            if (!absPath.empty()) {
                 std::wstring baseDir = absPath;
                 std::replace(baseDir.begin(), baseDir.end(), L'/', L'\\');
                 std::wstring archiveRelPath = L"";
@@ -1610,8 +1671,8 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
     }
 
     if (f && filename) {
-        wchar_t absPath[MAX_PATH];
-        if (GetFullPathNameW(filename, MAX_PATH, absPath, NULL) != 0) {
+        std::wstring absPath = GetFullPathSafe(filename);
+        if (!absPath.empty()) {
             std::wstring pathStr = absPath;
             std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
             std::wstring originalPath = pathStr;
