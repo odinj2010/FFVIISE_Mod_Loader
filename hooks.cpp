@@ -14,6 +14,16 @@
 #include <dwrite.h>
 #include <dxgi1_2.h>
 
+// Forward declarations for CRT hook types and pointers
+typedef FILE* (*_wfopen_t)(const wchar_t*, const wchar_t*);
+typedef size_t(*fread_t)(void*, size_t, size_t, FILE*);
+typedef int(*fseek_t)(FILE*, long, int);
+typedef int(*fclose_t)(FILE*);
+extern _wfopen_t OriginalWfopen;
+extern fread_t OriginalFread;
+extern fseek_t OriginalFseek;
+extern fclose_t OriginalFclose;
+
 // Direct3D11 / Direct2D overlay variables
 void Log(const char* format, ...);
 typedef HRESULT(WINAPI* IDXGISwapChainPresent_t)(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags);
@@ -46,6 +56,7 @@ bool g_D3D11HookInitialized = false;
 ULONGLONG g_StartTickCount = 0;
 bool g_OverlayEnabled = true;
 extern std::vector<std::wstring> g_ActiveMods;
+extern std::vector<std::wstring> g_ActivePlugins;
 
 // Direct2D/DirectWrite rendering resources
 ID2D1Factory* g_pD2DFactory = nullptr;
@@ -202,6 +213,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             char modsText[128];
             snprintf(modsText, sizeof(modsText), "Active Mods Loaded: %zu", g_ActiveMods.size());
             TextOutA(hdc, 25, 50, modsText, (int)strlen(modsText));
+
+            char pluginsText[128];
+            snprintf(pluginsText, sizeof(pluginsText), "Active Plugins Loaded: %zu", g_ActivePlugins.size());
+            TextOutA(hdc, 25, 75, pluginsText, (int)strlen(pluginsText));
 
             SelectObject(hdc, oldFont);
             DeleteObject(hFont);
@@ -448,6 +463,7 @@ std::wstring g_PluginsDirectory = L"plugins";
 std::wstring g_SplashScreens = L"custom";
 std::wstring g_BaseDir = L"";
 std::vector<std::wstring> g_ActiveMods;
+std::vector<std::wstring> g_ActivePlugins;
 bool g_EnableLogging = true;
 std::wstring g_LogFileName = L"mods_loader_log.txt";
 std::wstring g_LogPath = L"mods_loader_log.txt";
@@ -527,6 +543,7 @@ struct LgpEntry {
     DWORD dataStart; // Offset of the DATA-ENTRY_HEADER in the LGP
     DWORD size;      // Size of the raw file data
     std::wstring modFolder; // Name of the mod folder this entry resides in
+    DWORD originalDataStart = 0; // If from physical LGP, the original offset
 };
 
 struct RedirectState {
@@ -539,6 +556,7 @@ struct RedirectState {
     DWORD virtualFileOffset = 0; // Simulated pointer in the virtual LGP file
     std::vector<BYTE> virtualArchiveData; // Holds the header and TOC in memory
     std::wstring tempFilePath; // Path to the dummy file on disk
+    FILE* physicalLgpFile = nullptr; // Stream to read original assets from physical LGP directly
 
     // Active redirection state for LGP file handle
     bool isRedirecting = false;
@@ -548,6 +566,7 @@ struct RedirectState {
     DWORD overrideSize = 0;          // Size of the loose file
     DWORD fakeHeaderOffset = 0;      // If game is reading the 24-byte DATA-ENTRY_HEADER
     BYTE fakeHeader[24];
+    std::string activeEntryName; // Keep track of the currently active entry for redirection
 };
 
 int CharToLookupValue(char c) {
@@ -580,10 +599,48 @@ void PopulateVirtualLgp(const std::wstring& archiveRelPath, RedirectState& state
         std::wstring diskName;
         DWORD size;
         std::wstring modFolder;
+        DWORD originalDataStart = 0;
     };
     std::unordered_map<std::wstring, MergedFileInfo> mergedFiles;
+
+    // 1. Read base physical LGP if it exists
+    std::wstring originalLgpPath = g_BaseDir + L"\\ff7\\workingdir\\data\\" + archiveRelPath + L".lgp";
+    FILE* fLgp = OriginalWfopen(originalLgpPath.c_str(), L"rb");
+    if (fLgp) {
+        BYTE header[16];
+        if (OriginalFread(header, 1, 16, fLgp) == 16) {
+            DWORD numOriginalFiles = *(DWORD*)&header[12];
+            std::vector<BYTE> tocBuffer(numOriginalFiles * 27);
+            if (OriginalFread(tocBuffer.data(), 1, numOriginalFiles * 27, fLgp) == numOriginalFiles * 27) {
+                for (DWORD i = 0; i < numOriginalFiles; ++i) {
+                    BYTE* entryPtr = &tocBuffer[i * 27];
+                    char name[21] = { 0 };
+                    memcpy(name, entryPtr, 20);
+                    
+                    std::string entryName = name;
+                    std::wstring wEntryName(entryName.begin(), entryName.end());
+                    std::wstring lowerName = wEntryName;
+                    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+                    
+                    DWORD dataStart = *(DWORD*)&entryPtr[20];
+                    
+                    OriginalFseek(fLgp, dataStart + 20, SEEK_SET);
+                    DWORD sizeVal = 0;
+                    OriginalFread(&sizeVal, 1, 4, fLgp);
+                    
+                    MergedFileInfo info;
+                    info.diskName = wEntryName;
+                    info.size = sizeVal;
+                    info.modFolder = L"";
+                    info.originalDataStart = dataStart;
+                    mergedFiles[lowerName] = info;
+                }
+            }
+        }
+        OriginalFclose(fLgp);
+    }
     
-    // Scan in reverse order (lowest priority first) so higher priority overrides them
+    // 2. Scan active mods in reverse order (lowest priority first) so higher priority overrides them
     for (auto it = g_ActiveMods.rbegin(); it != g_ActiveMods.rend(); ++it) {
         std::wstring modFolder = *it;
         std::wstring archiveFolder = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\" + archiveRelPath;
@@ -597,6 +654,7 @@ void PopulateVirtualLgp(const std::wstring& archiveRelPath, RedirectState& state
                 info.diskName = file.name;
                 info.size = file.size;
                 info.modFolder = modFolder;
+                info.originalDataStart = 0;
                 mergedFiles[lowerName] = info;
             }
         }
@@ -619,6 +677,7 @@ void PopulateVirtualLgp(const std::wstring& archiveRelPath, RedirectState& state
         entry.diskName = pair.second.diskName;
         entry.size = pair.second.size;
         entry.modFolder = pair.second.modFolder;
+        entry.originalDataStart = pair.second.originalDataStart;
         state.entries[idx++] = entry;
     }
 
@@ -1103,6 +1162,7 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* exceptionInfo) {
 }
 
 void LoadPlugins() {
+    g_ActivePlugins.clear();
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     std::wstring exeStr = exePath;
@@ -1128,6 +1188,7 @@ void LoadPlugins() {
             HMODULE hPlugin = LoadLibraryW(fullPath.c_str());
             if (hPlugin) {
                 Log("[Plugins] Successfully loaded plugin: %S (Base: %p)\n", dllName.c_str(), hPlugin);
+                g_ActivePlugins.push_back(dllName);
             } else {
                 DWORD error = GetLastError();
                 Log("[Plugins] Failed to load plugin: %S. Error code: %d\n", dllName.c_str(), error);
@@ -1243,6 +1304,8 @@ void InitializeHooks() {
     }
 }
 
+std::wstring ResolveModPath(const std::wstring& relativePath);
+
 // Internal LGP Parser helper
 void ParseLgpTOC(FILE* f, RedirectState& state) {
     // LGP Header is 16 bytes: 12 bytes creator, 4 bytes file count
@@ -1294,6 +1357,16 @@ std::wstring ResolveModPath(const std::wstring& relativePath) {
         }
     }
     return L"";
+}
+
+std::wstring GetTempPathForArchive(const std::wstring& gameDir, const std::wstring& archiveRelPath) {
+    std::wstring safeName = archiveRelPath;
+    for (wchar_t& c : safeName) {
+        if (c == L'\\' || c == L'/') {
+            c = L'_';
+        }
+    }
+    return gameDir + L"\\" + g_ModsDirectory + L"\\" + safeName + L".tmp";
 }
 
 std::wstring ResolveModDirectoryPath(const std::wstring& relativePath) {
@@ -1401,7 +1474,7 @@ FILE* HookedFopen(const char* filename, const char* mode) {
     
     Log("[Loader] fopen called: %s (mode: %s)\n", filename ? filename : "NULL", mode ? mode : "NULL");
     FILE* f = OriginalFopen(filename, mode);
-    if (!f && filename) {
+    if (filename) {
         std::string pathStr = filename;
         std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::tolower);
 
@@ -1422,21 +1495,28 @@ FILE* HookedFopen(const char* filename, const char* mode) {
                 size_t dotPos = archiveRelPath.rfind(L'.');
                 if (dotPos != std::wstring::npos) archiveRelPath = archiveRelPath.substr(0, dotPos);
 
-                std::wstring gameDir = L"";
-                size_t dataPos = baseDir.find(L"\\ff7\\workingdir");
-                if (dataPos != std::wstring::npos) {
-                    gameDir = baseDir.substr(0, dataPos);
-                } else {
-                    wchar_t exePath[MAX_PATH];
-                    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-                    std::wstring exeStr = exePath;
-                    size_t exeSlash = exeStr.rfind(L'\\');
-                    if (exeSlash != std::wstring::npos) gameDir = exeStr.substr(0, exeSlash);
-                }
-
                 std::wstring archiveFolder = ResolveModDirectoryPath(archiveRelPath);
                 if (!archiveFolder.empty()) {
                     std::lock_guard<std::recursive_mutex> lock(g_Mutex);
+                    
+                    // Close the original physical LGP file handle first if we opened it
+                    if (f) {
+                        OriginalFclose(f);
+                        f = nullptr;
+                    }
+                    
+                    std::wstring gameDir = L"";
+                    size_t dataPos = baseDir.find(L"\\ff7\\workingdir");
+                    if (dataPos != std::wstring::npos) {
+                        gameDir = baseDir.substr(0, dataPos);
+                    } else {
+                        wchar_t exePath[MAX_PATH];
+                        GetModuleFileNameW(NULL, exePath, MAX_PATH);
+                        std::wstring exeStr = exePath;
+                        size_t exeSlash = exeStr.rfind(L'\\');
+                        if (exeSlash != std::wstring::npos) gameDir = exeStr.substr(0, exeSlash);
+                    }
+
                     RedirectState state;
                     state.archivePath = baseDir;
                     state.isLgp = true;
@@ -1446,78 +1526,55 @@ FILE* HookedFopen(const char* filename, const char* mode) {
                     for (const auto& entry : state.entries) {
                         totalVirtualSize += 24 + entry.size;
                     }
-                    totalVirtualSize += 14; // for the "FINAL FANTASY7" footer
+                    totalVirtualSize += 14; // footer
                     
-                    std::wstring tempPath = gameDir + L"\\" + g_ModsDirectory + L"\\" + archiveRelPath + L".tmp";
+                    std::wstring tempPath = GetTempPathForArchive(gameDir, archiveRelPath);
                     Log("[Loader] Creating temp file via Win32: %S\n", tempPath.c_str());
                     HANDLE hFile = CreateFileW(tempPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
                     if (hFile != INVALID_HANDLE_VALUE) {
                         DWORD bytesWritten = 0;
                         BOOL writeRes = WriteFile(hFile, state.virtualArchiveData.data(), (DWORD)state.virtualArchiveData.size(), &bytesWritten, NULL);
                         if (writeRes && bytesWritten == state.virtualArchiveData.size()) {
-                            Log("[Loader] Temp file header/TOC written successfully (%u bytes).\n", bytesWritten);
                             LARGE_INTEGER li;
                             li.QuadPart = totalVirtualSize;
                             if (SetFilePointerEx(hFile, li, NULL, FILE_BEGIN)) {
                                 if (SetEndOfFile(hFile)) {
-                                    Log("[Loader] Temp file sized to %u successfully via Win32.\n", totalVirtualSize);
-                                    
-                                    // Seek to end minus 14 and write the footer
                                     LARGE_INTEGER footerOffset;
                                     footerOffset.QuadPart = totalVirtualSize - 14;
                                     if (SetFilePointerEx(hFile, footerOffset, NULL, FILE_BEGIN)) {
                                         DWORD footerWritten = 0;
                                         WriteFile(hFile, "FINAL FANTASY7", 14, &footerWritten, NULL);
                                     }
-                                } else {
-                                    Log("[Loader] ERROR: SetEndOfFile failed. Error: %d\n", GetLastError());
                                 }
-                            } else {
-                                Log("[Loader] ERROR: SetFilePointerEx failed. Error: %d\n", GetLastError());
                             }
-                        } else {
-                            Log("[Loader] ERROR: WriteFile failed for temp file. Error: %d\n", GetLastError());
                         }
                         CloseHandle(hFile);
-                    } else {
-                        Log("[Loader] ERROR: CreateFileW failed for %S. Error: %d\n", tempPath.c_str(), GetLastError());
                     }
                     
-                    Log("[Loader] Re-opening temp file for read: %S\n", tempPath.c_str());
                     f = OriginalWfopen(tempPath.c_str(), L"rb");
                     if (f) {
-                        Log("[Loader] Faking missing LGP archive '%s' using folder '%S' (size: %d, tempFile: %S)\n", filename, archiveFolder.c_str(), totalVirtualSize, tempPath.c_str());
+                        Log("[Loader] Faking merged LGP archive '%s' using folder '%S' (size: %d, tempFile: %S)\n", filename, archiveFolder.c_str(), totalVirtualSize, tempPath.c_str());
                         state.tempFilePath = tempPath;
+                        
+                        // Open the physical LGP archive stream for fallbacks
+                        std::wstring physicalLgpPath = gameDir + L"\\ff7\\workingdir\\data\\" + archiveRelPath + L".lgp";
+                        state.physicalLgpFile = OriginalWfopen(physicalLgpPath.c_str(), L"rb");
+                        
                         g_RedirectStates[f] = state;
-                    } else {
-                        Log("[Loader] ERROR: Failed to re-open temp file for read: %S (errno: %d)\n", tempPath.c_str(), errno);
                     }
                 } else {
-                    Log("[Loader] Directory does not exist: %S\n", archiveFolder.c_str());
-                }
-            }
-        }
-    }
-
-    if (f && filename) {
-        std::wstring wFilename = AnsiToWide(filename);
-        std::wstring absPath = GetFullPathSafe(wFilename);
-        if (!absPath.empty()) {
-            std::wstring pathStr = absPath;
-            std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
-            std::wstring originalPath = pathStr;
-            std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
-
-            if (pathStr.find(L".lgp") != std::wstring::npos) {
-                std::lock_guard<std::recursive_mutex> lock(g_Mutex);
-                if (g_RedirectStates.find(f) == g_RedirectStates.end()) {
-                    RedirectState state;
-                    state.archivePath = originalPath;
-                    state.isLgp = true;
-                    ParseLgpTOC(f, state);
-                    
-                    OriginalFseek(f, 0, SEEK_SET);
-                    g_RedirectStates[f] = state;
+                    // No mod overrides, parse standard TOC
+                    if (f) {
+                        std::lock_guard<std::recursive_mutex> lock(g_Mutex);
+                        if (g_RedirectStates.find(f) == g_RedirectStates.end()) {
+                            RedirectState state;
+                            state.archivePath = baseDir;
+                            state.isLgp = true;
+                            ParseLgpTOC(f, state);
+                            OriginalFseek(f, 0, SEEK_SET);
+                            g_RedirectStates[f] = state;
+                        }
+                    }
                 }
             }
         }
@@ -1573,7 +1630,7 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
 
     Log("[Loader] _wfopen called: %S (mode: %S)\n", filename ? filename : L"NULL", mode ? mode : L"NULL");
     FILE* f = OriginalWfopen(filename, mode);
-    if (!f && filename) {
+    if (filename) {
         std::wstring pathStr = filename;
         std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
 
@@ -1593,21 +1650,28 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
                 size_t dotPos = archiveRelPath.rfind(L'.');
                 if (dotPos != std::wstring::npos) archiveRelPath = archiveRelPath.substr(0, dotPos);
 
-                std::wstring gameDir = L"";
-                size_t dataPos = baseDir.find(L"\\ff7\\workingdir");
-                if (dataPos != std::wstring::npos) {
-                    gameDir = baseDir.substr(0, dataPos);
-                } else {
-                    wchar_t exePath[MAX_PATH];
-                    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-                    std::wstring exeStr = exePath;
-                    size_t exeSlash = exeStr.rfind(L'\\');
-                    if (exeSlash != std::wstring::npos) gameDir = exeStr.substr(0, exeSlash);
-                }
-
                 std::wstring archiveFolder = ResolveModDirectoryPath(archiveRelPath);
                 if (!archiveFolder.empty()) {
                     std::lock_guard<std::recursive_mutex> lock(g_Mutex);
+                    
+                    // Close the original physical LGP file handle first if we opened it
+                    if (f) {
+                        OriginalFclose(f);
+                        f = nullptr;
+                    }
+                    
+                    std::wstring gameDir = L"";
+                    size_t dataPos = baseDir.find(L"\\ff7\\workingdir");
+                    if (dataPos != std::wstring::npos) {
+                        gameDir = baseDir.substr(0, dataPos);
+                    } else {
+                        wchar_t exePath[MAX_PATH];
+                        GetModuleFileNameW(NULL, exePath, MAX_PATH);
+                        std::wstring exeStr = exePath;
+                        size_t exeSlash = exeStr.rfind(L'\\');
+                        if (exeSlash != std::wstring::npos) gameDir = exeStr.substr(0, exeSlash);
+                    }
+
                     RedirectState state;
                     state.archivePath = baseDir;
                     state.isLgp = true;
@@ -1617,77 +1681,55 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
                     for (const auto& entry : state.entries) {
                         totalVirtualSize += 24 + entry.size;
                     }
-                    totalVirtualSize += 14; // for the "FINAL FANTASY7" footer
+                    totalVirtualSize += 14; // footer
                     
-                    std::wstring tempPath = gameDir + L"\\" + g_ModsDirectory + L"\\" + archiveRelPath + L".tmp";
+                    std::wstring tempPath = GetTempPathForArchive(gameDir, archiveRelPath);
                     Log("[Loader] Creating temp file via Win32: %S\n", tempPath.c_str());
                     HANDLE hFile = CreateFileW(tempPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
                     if (hFile != INVALID_HANDLE_VALUE) {
                         DWORD bytesWritten = 0;
                         BOOL writeRes = WriteFile(hFile, state.virtualArchiveData.data(), (DWORD)state.virtualArchiveData.size(), &bytesWritten, NULL);
                         if (writeRes && bytesWritten == state.virtualArchiveData.size()) {
-                            Log("[Loader] Temp file header/TOC written successfully (%u bytes).\n", bytesWritten);
                             LARGE_INTEGER li;
                             li.QuadPart = totalVirtualSize;
                             if (SetFilePointerEx(hFile, li, NULL, FILE_BEGIN)) {
                                 if (SetEndOfFile(hFile)) {
-                                    Log("[Loader] Temp file sized to %u successfully via Win32.\n", totalVirtualSize);
-                                    
-                                    // Seek to end minus 14 and write the footer
                                     LARGE_INTEGER footerOffset;
                                     footerOffset.QuadPart = totalVirtualSize - 14;
                                     if (SetFilePointerEx(hFile, footerOffset, NULL, FILE_BEGIN)) {
                                         DWORD footerWritten = 0;
                                         WriteFile(hFile, "FINAL FANTASY7", 14, &footerWritten, NULL);
                                     }
-                                } else {
-                                    Log("[Loader] ERROR: SetEndOfFile failed. Error: %d\n", GetLastError());
                                 }
-                            } else {
-                                Log("[Loader] ERROR: SetFilePointerEx failed. Error: %d\n", GetLastError());
                             }
-                        } else {
-                            Log("[Loader] ERROR: WriteFile failed for temp file. Error: %d\n", GetLastError());
                         }
                         CloseHandle(hFile);
-                    } else {
-                        Log("[Loader] ERROR: CreateFileW failed for %S. Error: %d\n", tempPath.c_str(), GetLastError());
                     }
                     
-                    Log("[Loader] Re-opening temp file for read: %S\n", tempPath.c_str());
                     f = OriginalWfopen(tempPath.c_str(), L"rb");
                     if (f) {
-                        Log("[Loader] Faking missing LGP archive '%S' using folder '%S' (size: %d, tempFile: %S)\n", filename, archiveFolder.c_str(), totalVirtualSize, tempPath.c_str());
+                        Log("[Loader] Faking merged LGP archive '%S' using folder '%S' (size: %d, tempFile: %S)\n", filename, archiveFolder.c_str(), totalVirtualSize, tempPath.c_str());
                         state.tempFilePath = tempPath;
+                        
+                        // Open the physical LGP archive stream for fallbacks
+                        std::wstring physicalLgpPath = gameDir + L"\\ff7\\workingdir\\data\\" + archiveRelPath + L".lgp";
+                        state.physicalLgpFile = OriginalWfopen(physicalLgpPath.c_str(), L"rb");
+                        
                         g_RedirectStates[f] = state;
-                    } else {
-                        Log("[Loader] ERROR: Failed to re-open temp file for read: %S (errno: %d)\n", tempPath.c_str(), errno);
                     }
                 } else {
-                    Log("[Loader] Directory does not exist: %S\n", archiveFolder.c_str());
-                }
-            }
-        }
-    }
-
-    if (f && filename) {
-        std::wstring absPath = GetFullPathSafe(filename);
-        if (!absPath.empty()) {
-            std::wstring pathStr = absPath;
-            std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
-            std::wstring originalPath = pathStr;
-            std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
-
-            if (pathStr.find(L".lgp") != std::wstring::npos) {
-                std::lock_guard<std::recursive_mutex> lock(g_Mutex);
-                if (g_RedirectStates.find(f) == g_RedirectStates.end()) {
-                    RedirectState state;
-                    state.archivePath = originalPath;
-                    state.isLgp = true;
-                    ParseLgpTOC(f, state);
-                    
-                    OriginalFseek(f, 0, SEEK_SET);
-                    g_RedirectStates[f] = state;
+                    // No mod overrides, parse standard TOC
+                    if (f) {
+                        std::lock_guard<std::recursive_mutex> lock(g_Mutex);
+                        if (g_RedirectStates.find(f) == g_RedirectStates.end()) {
+                            RedirectState state;
+                            state.archivePath = baseDir;
+                            state.isLgp = true;
+                            ParseLgpTOC(f, state);
+                            OriginalFseek(f, 0, SEEK_SET);
+                            g_RedirectStates[f] = state;
+                        }
+                    }
                 }
             }
         }
@@ -1699,41 +1741,131 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
 
 
 
+const LgpEntry* FindLgpEntry(const std::vector<LgpEntry>& entries, DWORD targetOffset) {
+    if (entries.empty()) return nullptr;
+    
+    // Binary search for the first entry that starts AFTER targetOffset
+    auto it = std::upper_bound(entries.begin(), entries.end(), targetOffset,
+        [](DWORD offset, const LgpEntry& entry) {
+            return offset < entry.dataStart;
+        });
+        
+    // The candidate entry is the one right before the upper bound
+    if (it != entries.begin()) {
+        const LgpEntry& entry = *(it - 1);
+        return &entry;
+    }
+    return nullptr;
+}
+
 void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
     state.virtualFileOffset = targetOffset;
-    state.isRedirecting = false;
-    if (state.overrideFile) {
-        OriginalFclose(state.overrideFile);
-        state.overrideFile = nullptr;
+
+    const LgpEntry* foundEntry = nullptr;
+
+    // 1. Check if the targetOffset is the start of any entry (either header or data start)
+    const LgpEntry* candidate = FindLgpEntry(state.entries, targetOffset);
+    if (candidate) {
+        if (targetOffset == candidate->dataStart || targetOffset == candidate->dataStart + 24) {
+            foundEntry = candidate;
+        }
     }
 
-    for (const auto& entry : state.entries) {
-        if (targetOffset >= entry.dataStart && targetOffset < entry.dataStart + 24 + entry.size) {
-            std::wstring baseDir = state.archivePath;
-            std::replace(baseDir.begin(), baseDir.end(), L'/', L'\\');
-            std::wstring gameDir = L"";
-            size_t dataPos = baseDir.find(L"\\ff7\\workingdir");
-            if (dataPos != std::wstring::npos) {
-                gameDir = baseDir.substr(0, dataPos);
-            } else {
-                wchar_t exePath[MAX_PATH];
-                GetModuleFileNameW(NULL, exePath, MAX_PATH);
-                std::wstring exeStr = exePath;
-                size_t exeSlash = exeStr.rfind(L'\\');
-                if (exeSlash != std::wstring::npos) gameDir = exeStr.substr(0, exeSlash);
+    // 2. If it's a random seek offset:
+    if (!foundEntry) {
+        if (state.isRedirecting) {
+            // Keep the currently active redirection active ONLY if the seek is within the redirected file's enlarged bounds.
+            if (candidate && candidate->name == state.activeEntryName) {
+                if (targetOffset >= candidate->dataStart && targetOffset < candidate->dataStart + 24 + state.overrideSize) {
+                    foundEntry = candidate;
+                }
             }
-
-            std::wstring archiveRelPath = L"";
-            size_t dataPosInArchive = baseDir.find(L"\\ff7\\workingdir\\data\\");
-            if (dataPosInArchive != std::wstring::npos) {
-                archiveRelPath = baseDir.substr(dataPosInArchive + 21);
-            } else {
-                size_t lastSlash = baseDir.rfind(L'\\');
-                archiveRelPath = (lastSlash != std::wstring::npos) ? baseDir.substr(lastSlash + 1) : baseDir;
+        } else {
+            // Find which entry the offset belongs to using original non-overlapping LGP boundaries.
+            if (candidate) {
+                if (targetOffset >= candidate->dataStart && targetOffset < candidate->dataStart + 24 + candidate->size) {
+                    foundEntry = candidate;
+                }
             }
-            size_t dotPos = archiveRelPath.rfind(L'.');
-            if (dotPos != std::wstring::npos) archiveRelPath = archiveRelPath.substr(0, dotPos);
+        }
+    }
 
+    // 3. Handle redirection status update based on the identified entry
+    if (foundEntry) {
+        const LgpEntry& entry = *foundEntry;
+        
+        // If we are switching to a different entry, close the previous override file
+        if (entry.name != state.activeEntryName) {
+            if (state.overrideFile) {
+                OriginalFclose(state.overrideFile);
+                state.overrideFile = nullptr;
+            }
+            state.isRedirecting = false;
+            state.activeEntryName = entry.name;
+        }
+
+        std::wstring baseDir = state.archivePath;
+        std::replace(baseDir.begin(), baseDir.end(), L'/', L'\\');
+        std::wstring gameDir = L"";
+        size_t dataPos = baseDir.find(L"\\ff7\\workingdir");
+        if (dataPos != std::wstring::npos) {
+            gameDir = baseDir.substr(0, dataPos);
+        } else {
+            wchar_t exePath[MAX_PATH];
+            GetModuleFileNameW(NULL, exePath, MAX_PATH);
+            std::wstring exeStr = exePath;
+            size_t exeSlash = exeStr.rfind(L'\\');
+            if (exeSlash != std::wstring::npos) gameDir = exeStr.substr(0, exeSlash);
+        }
+
+        std::wstring archiveRelPath = L"";
+        size_t dataPosInArchive = baseDir.find(L"\\ff7\\workingdir\\data\\");
+        if (dataPosInArchive != std::wstring::npos) {
+            archiveRelPath = baseDir.substr(dataPosInArchive + 21);
+        } else {
+            size_t lastSlash = baseDir.rfind(L'\\');
+            archiveRelPath = (lastSlash != std::wstring::npos) ? baseDir.substr(lastSlash + 1) : baseDir;
+        }
+        size_t dotPos = archiveRelPath.rfind(L'.');
+        if (dotPos != std::wstring::npos) archiveRelPath = archiveRelPath.substr(0, dotPos);
+
+        bool isPhysicalFallback = entry.modFolder.empty() && state.isVirtualLgp;
+        if (isPhysicalFallback) {
+            // Close any active loose override file
+            if (state.overrideFile) {
+                OriginalFclose(state.overrideFile);
+                state.overrideFile = nullptr;
+            }
+            
+            // Ensure physical LGP file stream is open
+            if (!state.physicalLgpFile) {
+                std::wstring physicalLgpPath = gameDir + L"\\ff7\\workingdir\\data\\" + archiveRelPath + L".lgp";
+                state.physicalLgpFile = OriginalWfopen(physicalLgpPath.c_str(), L"rb");
+            }
+            
+            if (state.physicalLgpFile) {
+                state.isRedirecting = true;
+                state.overrideSize = entry.size;
+                
+                memset(state.fakeHeader, 0, 24);
+                memcpy(state.fakeHeader, entry.name.c_str(), min(entry.name.size(), (size_t)20));
+                *(DWORD*)&state.fakeHeader[20] = entry.size;
+                
+                DWORD relOffset = targetOffset - entry.dataStart;
+                if (relOffset < 24) {
+                    state.fakeHeaderOffset = relOffset;
+                    state.overrideVirtualOffset = entry.originalDataStart + 24;
+                } else {
+                    state.fakeHeaderOffset = 24;
+                    state.overrideVirtualOffset = entry.originalDataStart + relOffset;
+                }
+                Log("[Loader] [Redirect] Virtual LGP redirected (Physical Fallback): entry %s -> physical LGP (virtualOffset: %d, relOffset: %d, size: %d, physOffset: %d)\n",
+                    entry.name.c_str(), state.virtualFileOffset, relOffset, entry.size, state.overrideVirtualOffset);
+            } else {
+                Log("[Loader] ERROR: [Redirect] Failed to open physical LGP fallback: %S\n", archiveRelPath.c_str());
+                state.isRedirecting = false;
+            }
+        } else {
             std::wstring overridePath = L"";
             if (state.isVirtualLgp) {
                 overridePath = gameDir + L"\\" + g_ModsDirectory + L"\\" + entry.modFolder + L"\\" + archiveRelPath + L"\\" + entry.diskName;
@@ -1745,16 +1877,23 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
                 state.isRedirecting = true;
                 state.overrideFilePath = overridePath;
                 
-                state.overrideFile = OriginalWfopen(overridePath.c_str(), L"rb");
+                if (!state.overrideFile) {
+                    state.overrideFile = OriginalWfopen(overridePath.c_str(), L"rb");
+                    if (state.overrideFile) {
+                        OriginalFseek(state.overrideFile, 0, SEEK_END);
+                        state.overrideSize = (DWORD)OriginalFtelli64(state.overrideFile);
+                        OriginalFseek(state.overrideFile, 0, SEEK_SET);
+                        
+                        memset(state.fakeHeader, 0, 24);
+                        memcpy(state.fakeHeader, entry.name.c_str(), min(entry.name.size(), (size_t)20));
+                        *(DWORD*)&state.fakeHeader[20] = state.overrideSize;
+                    } else {
+                        Log("[Loader] ERROR: [Redirect] Failed to open override file: %S (errno: %d)\n", overridePath.c_str(), errno);
+                        state.isRedirecting = false;
+                    }
+                }
+                
                 if (state.overrideFile) {
-                    OriginalFseek(state.overrideFile, 0, SEEK_END);
-                    state.overrideSize = (DWORD)OriginalFtelli64(state.overrideFile);
-                    OriginalFseek(state.overrideFile, 0, SEEK_SET);
-
-                    memset(state.fakeHeader, 0, 24);
-                    memcpy(state.fakeHeader, entry.name.c_str(), min(entry.name.size(), (size_t)20));
-                    *(DWORD*)&state.fakeHeader[20] = state.overrideSize;
-
                     DWORD relOffset = targetOffset - entry.dataStart;
                     if (relOffset < 24) {
                         state.fakeHeaderOffset = relOffset;
@@ -1764,12 +1903,24 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
                         state.overrideVirtualOffset = relOffset - 24;
                     }
                     Log("[Loader] [Redirect] Virtual LGP redirected: entry %s -> %S (virtualOffset: %d, relOffset: %d, overrideSize: %d)\n", entry.name.c_str(), overridePath.c_str(), state.virtualFileOffset, relOffset, state.overrideSize);
-                    break;
-                } else {
-                    Log("[Loader] ERROR: [Redirect] Failed to open override file: %S (errno: %d)\n", overridePath.c_str(), errno);
                 }
+            } else {
+                // No override for this entry, ensure we are not redirecting
+                if (state.overrideFile) {
+                    OriginalFclose(state.overrideFile);
+                    state.overrideFile = nullptr;
+                }
+                state.isRedirecting = false;
             }
         }
+    } else {
+        // Target offset fell outside of any entry's original boundaries
+        if (state.overrideFile) {
+            OriginalFclose(state.overrideFile);
+            state.overrideFile = nullptr;
+        }
+        state.isRedirecting = false;
+        state.activeEntryName.clear();
     }
 }
 
@@ -1827,12 +1978,14 @@ size_t HookedFread(void* buffer, size_t size, size_t count, FILE* stream) {
         RedirectState& state = it->second;
 
         if (state.isLgp) {
+            UpdateRedirection(stream, state, state.virtualFileOffset);
+
             DWORD totalRequested = (DWORD)(size * count);
             DWORD totalBytesRead = 0;
             DWORD bytesToRead = totalRequested;
             BYTE* destBuffer = (BYTE*)buffer;
 
-            if (state.isRedirecting && state.overrideFile) {
+            if (state.isRedirecting) {
                 if (state.fakeHeaderOffset < 24) {
                     DWORD headerBytesAvailable = 24 - state.fakeHeaderOffset;
                     DWORD chunk = min(bytesToRead, headerBytesAvailable);
@@ -1843,11 +1996,14 @@ size_t HookedFread(void* buffer, size_t size, size_t count, FILE* stream) {
                     totalBytesRead += chunk;
                 }
 
-                if (bytesToRead > 0 && state.overrideVirtualOffset < state.overrideSize) {
-                    OriginalFseek(state.overrideFile, state.overrideVirtualOffset, SEEK_SET);
-                    size_t actualRead = OriginalFread(destBuffer, 1, bytesToRead, state.overrideFile);
-                    state.overrideVirtualOffset += (DWORD)actualRead;
-                    totalBytesRead += (DWORD)actualRead;
+                if (bytesToRead > 0) {
+                    FILE* srcFile = state.overrideFile ? state.overrideFile : state.physicalLgpFile;
+                    if (srcFile) {
+                        OriginalFseek(srcFile, state.overrideVirtualOffset, SEEK_SET);
+                        size_t actualRead = OriginalFread(destBuffer, 1, bytesToRead, srcFile);
+                        state.overrideVirtualOffset += (DWORD)actualRead;
+                        totalBytesRead += (DWORD)actualRead;
+                    }
                 }
 
                 state.virtualFileOffset += totalBytesRead;
@@ -1856,7 +2012,7 @@ size_t HookedFread(void* buffer, size_t size, size_t count, FILE* stream) {
                 if (OriginalClearerr) OriginalClearerr(stream);
 
                 // If we hit EOF on the override file, force EOF on the dummy stream
-                if (state.overrideVirtualOffset >= state.overrideSize) {
+                if (state.overrideFile && state.overrideVirtualOffset >= state.overrideSize) {
                     OriginalFseek(stream, 0, SEEK_END);
                     char dummyChar;
                     OriginalFread(&dummyChar, 1, 1, stream);
@@ -1882,6 +2038,9 @@ int HookedFclose(FILE* stream) {
         Log("[Loader] fclose: Handle: %p (VirtualLgp: %d, Redirecting: %d)\n", stream, it->second.isVirtualLgp, it->second.isRedirecting);
         if (it->second.overrideFile) {
             OriginalFclose(it->second.overrideFile);
+        }
+        if (it->second.physicalLgpFile) {
+            OriginalFclose(it->second.physicalLgpFile);
         }
         std::wstring tempFile = it->second.tempFilePath;
         g_RedirectStates.erase(it);
@@ -1973,7 +2132,7 @@ errno_t __cdecl HookedGetStreamBufferPointers(FILE* stream, char*** base, char**
     auto it = g_RedirectStates.find(stream);
     if (it != g_RedirectStates.end()) {
         RedirectState& state = it->second;
-        if (state.isRedirecting && state.overrideFile) {
+        if (state.isRedirecting && state.overrideFile && !state.isLgp) {
             Log("[Loader] [_get_stream_buffer_pointers] Redirecting stream %p -> override file %p\n", stream, state.overrideFile);
             return OriginalGetStreamBufferPointers(state.overrideFile, base, ptr, count);
         }
@@ -2011,7 +2170,7 @@ int HookedFileno(FILE* stream) {
     auto it = g_RedirectStates.find(stream);
     if (it != g_RedirectStates.end()) {
         RedirectState& state = it->second;
-        if (state.isRedirecting && state.overrideFile) {
+        if (state.isRedirecting && state.overrideFile && !state.isLgp) {
             int fd = OriginalFileno(state.overrideFile);
             Log("[Loader] [_fileno] Redirecting stream %p -> override file fd %d\n", stream, fd);
             return fd;
