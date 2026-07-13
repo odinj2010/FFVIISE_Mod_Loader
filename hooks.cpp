@@ -909,7 +909,7 @@ int HookedFflush(FILE* stream);
 void HookedClearerr(FILE* stream);
 
 
-void LoadConfiguration() {
+void PreInitializeLogging() {
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     std::wstring exeStr = exePath;
@@ -949,6 +949,17 @@ void LoadConfiguration() {
     g_LogPath = (exeSlash != std::wstring::npos) ? exeStr.substr(0, exeSlash) + L"\\" + g_LogFileName : g_LogFileName;
     g_IniPath = iniPath;
 
+    if (g_EnableLogging) {
+        FILE* f = NULL;
+        _wfopen_s(&f, g_LogPath.c_str(), L"w");
+        if (f) {
+            fprintf(f, "[Loader] === Log Initialized (Fresh Start) ===\n");
+            fclose(f);
+        }
+    }
+}
+
+void LoadConfiguration() {
     // Load active mods order
     void LoadModsLoadOrder();
     LoadModsLoadOrder();
@@ -1201,18 +1212,9 @@ void LoadPlugins() {
 }
 
 void InitializeHooks() {
+    PreInitializeLogging();
     LoadConfiguration();
     
-    // Clear/Truncate the log file at startup
-    if (g_EnableLogging) {
-        FILE* f = NULL;
-        _wfopen_s(&f, g_LogPath.c_str(), L"w");
-        if (f) {
-            fprintf(f, "[Loader] === Log Initialized (Fresh Start) ===\n");
-            fclose(f);
-        }
-    }
-
     Log("[Loader] Initializing hooks via MinHook...\n");
     SetUnhandledExceptionFilter(CrashHandler);
 
