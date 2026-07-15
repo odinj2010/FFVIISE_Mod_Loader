@@ -48,6 +48,19 @@ typedef HRESULT(WINAPI* D3D11CreateDeviceAndSwapChain_t)(
 );
 D3D11CreateDeviceAndSwapChain_t OriginalD3D11CreateDeviceAndSwapChain = nullptr;
 
+DWORD WINAPI HookedGetFileAttributesW(LPCWSTR lpFileName);
+DWORD WINAPI HookedGetFileAttributesA(LPCSTR lpFileName);
+BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation);
+
+typedef DWORD (WINAPI* GetFileAttributesW_t)(LPCWSTR lpFileName);
+GetFileAttributesW_t OriginalGetFileAttributesW = nullptr;
+
+typedef DWORD (WINAPI* GetFileAttributesA_t)(LPCSTR lpFileName);
+GetFileAttributesA_t OriginalGetFileAttributesA = nullptr;
+
+typedef BOOL (WINAPI* GetFileAttributesExW_t)(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation);
+GetFileAttributesExW_t OriginalGetFileAttributesExW = nullptr;
+
 void* HookVMT(void* pInstance, int index, void* pHookFunc) {
     if (!pInstance) return nullptr;
     void** pVMT = *(void***)pInstance;
@@ -1725,6 +1738,27 @@ void InitializeHooks() {
             Log("[Loader] Failed to load/locate d3d11.dll\n");
         }
 
+        // Hook GetFileAttributesW/A/ExW to mock existence of layout_pc backgrounds inside mods
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            void* targetGetAttributesW = (void*)GetProcAddress(hKernel32, "GetFileAttributesW");
+            void* targetGetAttributesA = (void*)GetProcAddress(hKernel32, "GetFileAttributesA");
+            void* targetGetAttributesExW = (void*)GetProcAddress(hKernel32, "GetFileAttributesExW");
+
+            if (targetGetAttributesW) {
+                MH_STATUS status = MH_CreateHook(targetGetAttributesW, (LPVOID)&HookedGetFileAttributesW, (LPVOID*)&OriginalGetFileAttributesW);
+                Log("[Loader] Hooked GetFileAttributesW. Status: %d\n", status);
+            }
+            if (targetGetAttributesA) {
+                MH_STATUS status = MH_CreateHook(targetGetAttributesA, (LPVOID)&HookedGetFileAttributesA, (LPVOID*)&OriginalGetFileAttributesA);
+                Log("[Loader] Hooked GetFileAttributesA. Status: %d\n", status);
+            }
+            if (targetGetAttributesExW) {
+                MH_STATUS status = MH_CreateHook(targetGetAttributesExW, (LPVOID)&HookedGetFileAttributesExW, (LPVOID*)&OriginalGetFileAttributesExW);
+                Log("[Loader] Hooked GetFileAttributesExW. Status: %d\n", status);
+            }
+        }
+
 
 
         MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
@@ -2226,6 +2260,151 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
     }
     Log("[Loader] _wfopen returned: %p for %S\n", f, filename ? filename : L"NULL");
     return f;
+}
+
+
+
+DWORD WINAPI HookedGetFileAttributesW(LPCWSTR lpFileName) {
+    if (lpFileName) {
+        std::wstring absPath = GetFullPathSafe(lpFileName);
+        if (!absPath.empty()) {
+            std::wstring pathStr = absPath;
+            std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
+            std::wstring originalPath = pathStr;
+            std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
+
+            size_t dataPos = pathStr.find(L"\\data\\");
+            if (dataPos != std::wstring::npos) {
+                size_t prefixLen = 6;
+                size_t workingDirPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
+                if (workingDirPos != std::wstring::npos && workingDirPos <= dataPos) {
+                    prefixLen = 21;
+                    dataPos = workingDirPos;
+                }
+                std::wstring relPath = originalPath.substr(dataPos + prefixLen);
+                std::wstring overridePath = ResolveModPath(relPath);
+
+                if (overridePath.empty()) {
+                    overridePath = ResolveModDirectoryPath(relPath);
+                }
+
+                // If it starts with layout_pc flevel also try matching field
+                if (overridePath.empty()) {
+                    std::wstring lowerRel = relPath;
+                    std::transform(lowerRel.begin(), lowerRel.end(), lowerRel.begin(), ::towlower);
+                    if (lowerRel.rfind(L"layout_pc\\flevel\\", 0) == 0) {
+                        std::wstring fieldRelPath = L"field\\" + relPath.substr(17);
+                        overridePath = ResolveModPath(fieldRelPath);
+                        if (overridePath.empty()) {
+                            overridePath = ResolveModDirectoryPath(fieldRelPath);
+                        }
+                    }
+                }
+
+                if (!overridePath.empty()) {
+                    Log("[Loader] [Redirect] GetFileAttributesW redirected: %S -> %S\n", lpFileName, overridePath.c_str());
+                    return OriginalGetFileAttributesW(overridePath.c_str());
+                }
+            }
+        }
+    }
+    return OriginalGetFileAttributesW(lpFileName);
+}
+
+DWORD WINAPI HookedGetFileAttributesA(LPCSTR lpFileName) {
+    if (lpFileName) {
+        std::wstring wFilename = AnsiToWide(lpFileName);
+        std::wstring absPath = GetFullPathSafe(wFilename);
+        if (!absPath.empty()) {
+            std::wstring pathStr = absPath;
+            std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
+            std::wstring originalPath = pathStr;
+            std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
+
+            size_t dataPos = pathStr.find(L"\\data\\");
+            if (dataPos != std::wstring::npos) {
+                size_t prefixLen = 6;
+                size_t workingDirPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
+                if (workingDirPos != std::wstring::npos && workingDirPos <= dataPos) {
+                    prefixLen = 21;
+                    dataPos = workingDirPos;
+                }
+                std::wstring relPath = originalPath.substr(dataPos + prefixLen);
+                std::wstring overridePath = ResolveModPath(relPath);
+
+                if (overridePath.empty()) {
+                    overridePath = ResolveModDirectoryPath(relPath);
+                }
+
+                // If it starts with layout_pc flevel also try matching field
+                if (overridePath.empty()) {
+                    std::wstring lowerRel = relPath;
+                    std::transform(lowerRel.begin(), lowerRel.end(), lowerRel.begin(), ::towlower);
+                    if (lowerRel.rfind(L"layout_pc\\flevel\\", 0) == 0) {
+                        std::wstring fieldRelPath = L"field\\" + relPath.substr(17);
+                        overridePath = ResolveModPath(fieldRelPath);
+                        if (overridePath.empty()) {
+                            overridePath = ResolveModDirectoryPath(fieldRelPath);
+                        }
+                    }
+                }
+
+                if (!overridePath.empty()) {
+                    std::string cOverridePath = WideToAnsi(overridePath);
+                    Log("[Loader] [Redirect] GetFileAttributesA redirected: %s -> %s\n", lpFileName, cOverridePath.c_str());
+                    return OriginalGetFileAttributesA(cOverridePath.c_str());
+                }
+            }
+        }
+    }
+    return OriginalGetFileAttributesA(lpFileName);
+}
+
+BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation) {
+    if (lpFileName) {
+        std::wstring absPath = GetFullPathSafe(lpFileName);
+        if (!absPath.empty()) {
+            std::wstring pathStr = absPath;
+            std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
+            std::wstring originalPath = pathStr;
+            std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
+
+            size_t dataPos = pathStr.find(L"\\data\\");
+            if (dataPos != std::wstring::npos) {
+                size_t prefixLen = 6;
+                size_t workingDirPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
+                if (workingDirPos != std::wstring::npos && workingDirPos <= dataPos) {
+                    prefixLen = 21;
+                    dataPos = workingDirPos;
+                }
+                std::wstring relPath = originalPath.substr(dataPos + prefixLen);
+                std::wstring overridePath = ResolveModPath(relPath);
+
+                if (overridePath.empty()) {
+                    overridePath = ResolveModDirectoryPath(relPath);
+                }
+
+                // If it starts with layout_pc flevel also try matching field
+                if (overridePath.empty()) {
+                    std::wstring lowerRel = relPath;
+                    std::transform(lowerRel.begin(), lowerRel.end(), lowerRel.begin(), ::towlower);
+                    if (lowerRel.rfind(L"layout_pc\\flevel\\", 0) == 0) {
+                        std::wstring fieldRelPath = L"field\\" + relPath.substr(17);
+                        overridePath = ResolveModPath(fieldRelPath);
+                        if (overridePath.empty()) {
+                            overridePath = ResolveModDirectoryPath(fieldRelPath);
+                        }
+                    }
+                }
+
+                if (!overridePath.empty()) {
+                    Log("[Loader] [Redirect] GetFileAttributesExW redirected: %S -> %S\n", lpFileName, overridePath.c_str());
+                    return OriginalGetFileAttributesExW(overridePath.c_str(), fInfoLevelId, lpFileInformation);
+                }
+            }
+        }
+    }
+    return OriginalGetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
 }
 
 
