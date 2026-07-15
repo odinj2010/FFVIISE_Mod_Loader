@@ -1234,7 +1234,11 @@ bool ContainsKeywordAnsi(const char* str) {
             s.find("workingdir") != std::string::npos ||
             s.find(".lgp") != std::string::npos ||
             s.find("logo") != std::string::npos ||
-            s.find("start") != std::string::npos);
+            s.find("start") != std::string::npos ||
+            s.find("layout_pc") != std::string::npos ||
+            s.find("flevel") != std::string::npos ||
+            s.find("field") != std::string::npos ||
+            s.find("data") != std::string::npos);
 }
 
 bool ContainsKeywordWide(const wchar_t* str) {
@@ -1247,7 +1251,11 @@ bool ContainsKeywordWide(const wchar_t* str) {
             s.find(L"workingdir") != std::wstring::npos ||
             s.find(L".lgp") != std::wstring::npos ||
             s.find(L"logo") != std::wstring::npos ||
-            s.find(L"start") != std::wstring::npos);
+            s.find(L"start") != std::wstring::npos ||
+            s.find(L"layout_pc") != std::wstring::npos ||
+            s.find(L"flevel") != std::wstring::npos ||
+            s.find(L"field") != std::wstring::npos ||
+            s.find(L"data") != std::wstring::npos);
 }
 
 
@@ -1895,13 +1903,30 @@ FILE* HookedFopen(const char* filename, const char* mode) {
                 return fRedirect;
             }
 
-            size_t dataPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
+            size_t dataPos = pathStr.find(L"\\data\\");
             if (dataPos != std::wstring::npos) {
-                std::wstring relPath = originalPath.substr(dataPos + 21);
+                size_t prefixLen = 6;
+                size_t workingDirPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
+                if (workingDirPos != std::wstring::npos && workingDirPos <= dataPos) {
+                    prefixLen = 21;
+                    dataPos = workingDirPos;
+                }
+                std::wstring relPath = originalPath.substr(dataPos + prefixLen);
                 std::wstring overridePath = ResolveModPath(relPath);
+
+                // If it starts with layout_pc\\flevel\\, also try matching field directory
+                if (overridePath.empty()) {
+                    std::wstring lowerRel = relPath;
+                    std::transform(lowerRel.begin(), lowerRel.end(), lowerRel.begin(), ::towlower);
+                    if (lowerRel.rfind(L"layout_pc\\flevel\\", 0) == 0) {
+                        std::wstring fieldRelPath = L"field\\" + relPath.substr(17);
+                        overridePath = ResolveModPath(fieldRelPath);
+                    }
+                }
+
                 if (!overridePath.empty()) {
                     std::string cOverridePath = WideToAnsi(overridePath);
-                    Log("[Loader] Redirecting fopen: %s -> %s\n", filename, cOverridePath.c_str());
+                    Log("[Loader] [Redirect] File redirected: %s -> %s\n", filename, cOverridePath.c_str());
                     FILE* fRedirect = OriginalFopen(cOverridePath.c_str(), mode);
                     Log("[Loader] Redirecting fopen returned: %p\n", fRedirect);
                     return fRedirect;
@@ -2062,12 +2087,29 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
                 return fRedirect;
             }
 
-            size_t dataPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
+            size_t dataPos = pathStr.find(L"\\data\\");
             if (dataPos != std::wstring::npos) {
-                std::wstring relPath = originalPath.substr(dataPos + 21);
+                size_t prefixLen = 6;
+                size_t workingDirPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
+                if (workingDirPos != std::wstring::npos && workingDirPos <= dataPos) {
+                    prefixLen = 21;
+                    dataPos = workingDirPos;
+                }
+                std::wstring relPath = originalPath.substr(dataPos + prefixLen);
                 std::wstring overridePath = ResolveModPath(relPath);
+
+                // If it starts with layout_pc\\flevel\\, also try matching field directory
+                if (overridePath.empty()) {
+                    std::wstring lowerRel = relPath;
+                    std::transform(lowerRel.begin(), lowerRel.end(), lowerRel.begin(), ::towlower);
+                    if (lowerRel.rfind(L"layout_pc\\flevel\\", 0) == 0) {
+                        std::wstring fieldRelPath = L"field\\" + relPath.substr(17);
+                        overridePath = ResolveModPath(fieldRelPath);
+                    }
+                }
+
                 if (!overridePath.empty()) {
-                    Log("[Loader] Redirecting _wfopen: %S -> %S\n", filename, overridePath.c_str());
+                    Log("[Loader] [Redirect] File redirected: %S -> %S\n", filename, overridePath.c_str());
                     FILE* fRedirect = OriginalWfopen(overridePath.c_str(), mode);
                     Log("[Loader] Redirecting _wfopen returned: %p\n", fRedirect);
                     return fRedirect;
