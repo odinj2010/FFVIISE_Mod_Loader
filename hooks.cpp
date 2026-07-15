@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <mutex>
 #include <algorithm>
@@ -40,6 +41,33 @@ typedef HRESULT(STDMETHODCALLTYPE* CreateTexture2D_t)(
 );
 CreateTexture2D_t OriginalCreateTexture2D = nullptr;
 
+typedef void (STDMETHODCALLTYPE* CopySubresourceRegion_t)(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pDstResource,
+    UINT DstSubresource,
+    UINT DstX,
+    UINT DstY,
+    UINT DstZ,
+    ID3D11Resource* pSrcResource,
+    UINT SrcSubresource,
+    const D3D11_BOX* pSrcBox
+);
+CopySubresourceRegion_t OriginalCopySubresourceRegion = nullptr;
+
+typedef void (STDMETHODCALLTYPE* UpdateSubresource_t)(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pDstResource,
+    UINT DstSubresource,
+    const D3D11_BOX* pDstBox,
+    const void* pSrcData,
+    UINT SrcRowPitch,
+    UINT SrcDepthPitch
+);
+UpdateSubresource_t OriginalUpdateSubresource = nullptr;
+
+std::unordered_set<ID3D11Resource*> g_SwappedResources;
+std::mutex g_SwappedResourcesMutex;
+
 typedef HRESULT(WINAPI* D3D11CreateDeviceAndSwapChain_t)(
     IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
     const D3D_FEATURE_LEVEL*, UINT, UINT,
@@ -59,6 +87,52 @@ void* HookVMT(void* pInstance, int index, void* pHookFunc) {
         VirtualProtect(&pVMT[index], sizeof(void*), oldProtect, &oldProtect);
     }
     return pOriginal;
+}
+
+void STDMETHODCALLTYPE HookedCopySubresourceRegion(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pDstResource,
+    UINT DstSubresource,
+    UINT DstX,
+    UINT DstY,
+    UINT DstZ,
+    ID3D11Resource* pSrcResource,
+    UINT SrcSubresource,
+    const D3D11_BOX* pSrcBox
+) {
+    bool isSwapped = false;
+    {
+        std::lock_guard<std::mutex> lock(g_SwappedResourcesMutex);
+        if (g_SwappedResources.count(pDstResource) > 0) {
+            isSwapped = true;
+        }
+    }
+    if (isSwapped) {
+        return;
+    }
+    OriginalCopySubresourceRegion(This, pDstResource, DstSubresource, DstX, DstY, DstZ, pSrcResource, SrcSubresource, pSrcBox);
+}
+
+void STDMETHODCALLTYPE HookedUpdateSubresource(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pDstResource,
+    UINT DstSubresource,
+    const D3D11_BOX* pDstBox,
+    const void* pSrcData,
+    UINT SrcRowPitch,
+    UINT SrcDepthPitch
+) {
+    bool isSwapped = false;
+    {
+        std::lock_guard<std::mutex> lock(g_SwappedResourcesMutex);
+        if (g_SwappedResources.count(pDstResource) > 0) {
+            isSwapped = true;
+        }
+    }
+    if (isSwapped) {
+        return;
+    }
+    OriginalUpdateSubresource(This, pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
 }
 
 HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
@@ -91,8 +165,6 @@ std::vector<int> g_ActiveFieldTexIndices;
 std::wstring g_CurrentFieldTexName = L"";
 bool g_EnableTextureLogging = false;
 bool g_DisableD3D11Hooks = false;
-// Direct3D 11 Context hook declarations removed
-
 extern std::wstring g_TextureLogPath;
 extern std::vector<std::wstring> g_ActiveMods;
 extern std::vector<std::wstring> g_ActivePlugins;
@@ -781,6 +853,12 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 if (SUCCEEDED(hrLoad) && pOverrideTex) {
                     (*ppTexture2D)->Release();
                     *ppTexture2D = pOverrideTex;
+                    
+                    {
+                        std::lock_guard<std::mutex> lock(g_SwappedResourcesMutex);
+                        g_SwappedResources.insert(pOverrideTex);
+                    }
+                    
                     Log("[Loader] Swapped static texture %S in CreateTexture2D: Override=%p\n", assetName.c_str(), pOverrideTex);
                 } else {
                     Log("[Loader] ERROR: LoadOverrideTexture failed for path %S: 0x%08X\n", overridePath.c_str(), hrLoad);
@@ -828,6 +906,19 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
                 Log("[Loader] Hooking ID3D11Device::CreateTexture2D via VMT...\n");
                 OriginalCreateTexture2D = (CreateTexture2D_t)HookVMT(pDevice, 5, HookedCreateTexture2D);
                 Log("[Loader] ID3D11Device::CreateTexture2D Hooked via VMT! Original: %p\n", OriginalCreateTexture2D);
+            }
+        }
+        if (ppImmediateContext && *ppImmediateContext) {
+            ID3D11DeviceContext* pContext = *ppImmediateContext;
+            if (!OriginalCopySubresourceRegion) {
+                Log("[Loader] Hooking ID3D11DeviceContext::CopySubresourceRegion via VMT...\n");
+                OriginalCopySubresourceRegion = (CopySubresourceRegion_t)HookVMT(pContext, 46, HookedCopySubresourceRegion);
+                Log("[Loader] ID3D11DeviceContext::CopySubresourceRegion Hooked via VMT! Original: %p\n", OriginalCopySubresourceRegion);
+            }
+            if (!OriginalUpdateSubresource) {
+                Log("[Loader] Hooking ID3D11DeviceContext::UpdateSubresource via VMT...\n");
+                OriginalUpdateSubresource = (UpdateSubresource_t)HookVMT(pContext, 48, HookedUpdateSubresource);
+                Log("[Loader] ID3D11DeviceContext::UpdateSubresource Hooked via VMT! Original: %p\n", OriginalUpdateSubresource);
             }
         }
         if (ppSwapChain && *ppSwapChain) {
