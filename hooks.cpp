@@ -85,6 +85,10 @@ std::wstring g_ActiveStageName = L"";
 int g_StageTextureCounter = 0;
 int g_MaxStageTextures = 0;
 std::wstring g_CurrentStageTexName = L"";
+std::wstring g_ActiveFieldName = L"";
+int g_FieldTextureCounter = 0;
+int g_MaxFieldTextures = 0;
+std::wstring g_CurrentFieldTexName = L"";
 bool g_EnableTextureLogging = false;
 bool g_DisableD3D11Hooks = false;
 // Direct3D 11 Context hook declarations removed
@@ -671,14 +675,23 @@ std::wstring ResolveTextureOverride(const std::wstring& assetName) {
     }
 
     for (const auto& modFolder : g_ActiveMods) {
-        // 1. Check under /textures/
+        // 1. Check under /field/<fieldName>/
+        if (!g_ActiveFieldName.empty()) {
+            std::wstring fieldPngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\field\\" + g_ActiveFieldName + L"\\" + baseName + L".png";
+            if (FileExists(fieldPngPath)) return fieldPngPath;
+
+            std::wstring fieldDdsPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\field\\" + g_ActiveFieldName + L"\\" + baseName + L".dds";
+            if (FileExists(fieldDdsPath)) return fieldDdsPath;
+        }
+
+        // 2. Check under /textures/
         std::wstring pngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\textures\\" + baseName + L".png";
         if (FileExists(pngPath)) return pngPath;
 
         std::wstring ddsPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\textures\\" + baseName + L".dds";
         if (FileExists(ddsPath)) return ddsPath;
 
-        // 2. Check under /battle/ (specifically for battle stages/assets)
+        // 3. Check under /battle/ (specifically for battle stages/assets)
         std::wstring battlePngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\battle\\" + baseName + L".png";
         if (FileExists(battlePngPath)) return battlePngPath;
 
@@ -730,6 +743,17 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
             } else if (pDesc->Usage == 0 && !g_CurrentStageTexName.empty() && pDesc->BindFlags == 40) {
                 assetName = g_CurrentStageTexName;
                 g_CurrentStageTexName = L""; // Consume and clear immediately to prevent matching subsequent static textures!
+            }
+        } else if (!g_ActiveFieldName.empty() && g_MaxFieldTextures > 0) {
+            if (pDesc->Usage == 2 && pDesc->BindFlags == 8 && g_FieldTextureCounter < g_MaxFieldTextures) {
+                wchar_t fieldTexName[128];
+                swprintf_s(fieldTexName, L"%s_%02d_00", g_ActiveFieldName.c_str(), g_FieldTextureCounter);
+                g_CurrentFieldTexName = fieldTexName;
+                g_FieldTextureCounter++;
+                assetName = g_CurrentFieldTexName;
+            } else if (pDesc->Usage == 0 && !g_CurrentFieldTexName.empty() && pDesc->BindFlags == 40) {
+                assetName = g_CurrentFieldTexName;
+                g_CurrentFieldTexName = L""; // Consume and clear immediately
             }
         }
 
@@ -2265,6 +2289,11 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
                             g_CurrentStageTexName = L"";
                             g_LastLoadedTexFile = L""; // Clear character texture tracking
                             
+                            g_ActiveFieldName = L"";
+                            g_FieldTextureCounter = 0;
+                            g_CurrentFieldTexName = L"";
+                            g_MaxFieldTextures = 0;
+                            
                             // Calculate max stage textures in active mods
                             g_MaxStageTextures = 0;
                             for (const auto& mod : g_ActiveMods) {
@@ -2289,6 +2318,35 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
                         }
                     }
                 }
+            }
+        } else if (archivePathLower.find(L"flevel.lgp") != std::wstring::npos) {
+            std::wstring fieldName = entryNameLower;
+            if (fieldName != g_ActiveFieldName) {
+                g_ActiveFieldName = fieldName;
+                g_FieldTextureCounter = 0;
+                g_CurrentFieldTexName = L"";
+                g_MaxFieldTextures = 0;
+
+                // Calculate max field textures in active mods for this map
+                for (const auto& mod : g_ActiveMods) {
+                    std::wstring modFieldDir = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + mod + L"\\field\\" + g_ActiveFieldName;
+                    for (int i = 0; i < 99; i++) {
+                        wchar_t fileBuf[MAX_PATH];
+                        swprintf_s(fileBuf, L"%s\\%s_%02d_00.png", modFieldDir.c_str(), g_ActiveFieldName.c_str(), i);
+                        if (FileExists(fileBuf)) {
+                            if (i + 1 > g_MaxFieldTextures) {
+                                g_MaxFieldTextures = i + 1;
+                            }
+                        }
+                        swprintf_s(fileBuf, L"%s\\%s_%02d_00.dds", modFieldDir.c_str(), g_ActiveFieldName.c_str(), i);
+                        if (FileExists(fileBuf)) {
+                            if (i + 1 > g_MaxFieldTextures) {
+                                g_MaxFieldTextures = i + 1;
+                            }
+                        }
+                    }
+                }
+                Log("[Loader] Active field map set to: %S - Max override textures: %d\n", g_ActiveFieldName.c_str(), g_MaxFieldTextures);
             }
         } else {
             if (entryNameLower.find(L".tex") != std::wstring::npos) {
