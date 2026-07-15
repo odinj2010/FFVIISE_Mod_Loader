@@ -13,6 +13,9 @@
 #include <d2d1_1.h>
 #include <dwrite.h>
 #include <dxgi1_2.h>
+#include <wincodec.h>
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
 
 // Forward declarations for CRT hook types and pointers
 typedef FILE* (*_wfopen_t)(const wchar_t*, const wchar_t*);
@@ -29,6 +32,14 @@ void Log(const char* format, ...);
 typedef HRESULT(WINAPI* IDXGISwapChainPresent_t)(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags);
 IDXGISwapChainPresent_t OriginalPresent = nullptr;
 
+typedef HRESULT(STDMETHODCALLTYPE* CreateTexture2D_t)(
+    ID3D11Device* This,
+    const D3D11_TEXTURE2D_DESC* pDesc,
+    const D3D11_SUBRESOURCE_DATA* pInitialData,
+    ID3D11Texture2D** ppTexture2D
+);
+CreateTexture2D_t OriginalCreateTexture2D = nullptr;
+
 typedef HRESULT(WINAPI* D3D11CreateDeviceAndSwapChain_t)(
     IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
     const D3D_FEATURE_LEVEL*, UINT, UINT,
@@ -36,6 +47,19 @@ typedef HRESULT(WINAPI* D3D11CreateDeviceAndSwapChain_t)(
     ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**
 );
 D3D11CreateDeviceAndSwapChain_t OriginalD3D11CreateDeviceAndSwapChain = nullptr;
+
+void* HookVMT(void* pInstance, int index, void* pHookFunc) {
+    if (!pInstance) return nullptr;
+    void** pVMT = *(void***)pInstance;
+    if (!pVMT) return nullptr;
+    void* pOriginal = pVMT[index];
+    DWORD oldProtect;
+    if (VirtualProtect(&pVMT[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        pVMT[index] = pHookFunc;
+        VirtualProtect(&pVMT[index], sizeof(void*), oldProtect, &oldProtect);
+    }
+    return pOriginal;
+}
 
 HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
     IDXGIAdapter* pAdapter,
@@ -55,8 +79,24 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
 bool g_D3D11HookInitialized = false;
 ULONGLONG g_StartTickCount = 0;
 bool g_OverlayEnabled = true;
+thread_local std::wstring g_LastLoadedTexFile = L"";
+thread_local bool t_InHookCreateTexture2D = false;
+std::wstring g_ActiveStageName = L"";
+int g_StageTextureCounter = 0;
+int g_MaxStageTextures = 0;
+std::wstring g_CurrentStageTexName = L"";
+bool g_EnableTextureLogging = false;
+bool g_DisableD3D11Hooks = false;
+// Direct3D 11 Context hook declarations removed
+
+extern std::wstring g_TextureLogPath;
 extern std::vector<std::wstring> g_ActiveMods;
 extern std::vector<std::wstring> g_ActivePlugins;
+extern std::wstring g_BaseDir;
+extern std::wstring g_ModsDirectory;
+bool FileExists(const std::wstring& path);
+std::string WideToAnsi(const std::wstring& wstr);
+std::wstring AnsiToWide(const std::string& str);
 
 // Direct2D/DirectWrite rendering resources
 ID2D1Factory* g_pD2DFactory = nullptr;
@@ -330,17 +370,9 @@ HRESULT WINAPI HookedCreateSwapChainForHwnd(
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain) {
         IDXGISwapChain* pSwapChain = (IDXGISwapChain*)*ppSwapChain;
         if (!OriginalPresent) {
-            void** pVMT = *(void***)pSwapChain;
-            void* pPresent = pVMT[8];
-            Log("[Loader] SwapChain created via CreateSwapChainForHwnd! Hooking Present (%p)...\n", pPresent);
-
-            MH_STATUS status = MH_CreateHook(pPresent, (LPVOID)&HookedPresent, (LPVOID*)&OriginalPresent);
-            if (status == MH_OK) {
-                MH_STATUS enableStatus = MH_EnableHook(pPresent);
-                Log("[Loader] D3D11 SwapChain Present Hooked successfully! Status: %d\n", enableStatus);
-            } else {
-                Log("[Loader] Failed to hook Present. Error: %d\n", status);
-            }
+            Log("[Loader] SwapChain created via CreateSwapChainForHwnd! Hooking Present via VMT...\n");
+            OriginalPresent = (IDXGISwapChainPresent_t)HookVMT(pSwapChain, 8, HookedPresent);
+            Log("[Loader] D3D11 SwapChain Present Hooked via VMT! Original: %p\n", OriginalPresent);
         }
     }
     return hr;
@@ -352,19 +384,385 @@ HRESULT WINAPI HookedCreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, 
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain) {
         IDXGISwapChain* pSwapChain = *ppSwapChain;
         if (!OriginalPresent) {
-            void** pVMT = *(void***)pSwapChain;
-            void* pPresent = pVMT[8];
-            Log("[Loader] SwapChain created via IDXGIFactory! Hooking Present (%p)...\n", pPresent);
+            Log("[Loader] SwapChain created via IDXGIFactory! Hooking Present via VMT...\n");
+            OriginalPresent = (IDXGISwapChainPresent_t)HookVMT(pSwapChain, 8, HookedPresent);
+            Log("[Loader] D3D11 SwapChain Present Hooked via VMT! Original: %p\n", OriginalPresent);
+        }
+    }
+    return hr;
+}
 
-            MH_STATUS status = MH_CreateHook(pPresent, (LPVOID)&HookedPresent, (LPVOID*)&OriginalPresent);
-            if (status == MH_OK) {
-                MH_STATUS enableStatus = MH_EnableHook(pPresent);
-                Log("[Loader] D3D11 SwapChain Present Hooked successfully! Status: %d\n", enableStatus);
-            } else {
-                Log("[Loader] Failed to hook Present. Error: %d\n", status);
+void LogTexture(const char* format, ...) {
+    if (!g_EnableTextureLogging) return;
+
+    FILE* f = NULL;
+    _wfopen_s(&f, g_TextureLogPath.c_str(), L"a");
+    if (f) {
+        va_list args;
+        va_start(args, format);
+        vfprintf(f, format, args);
+        va_end(args);
+        fclose(f);
+    }
+}
+
+struct DDS_PIXELFORMAT {
+    DWORD dwSize;
+    DWORD dwFlags;
+    DWORD dwFourCC;
+    DWORD dwRGBBitCount;
+    DWORD dwRBitMask;
+    DWORD dwGBitMask;
+    DWORD dwBBitMask;
+    DWORD dwABitMask;
+};
+
+struct DDS_HEADER {
+    DWORD           dwSize;
+    DWORD           dwFlags;
+    DWORD           dwHeight;
+    DWORD           dwWidth;
+    DWORD           dwPitchOrLinearSize;
+    DWORD           dwDepth;
+    DWORD           dwMipMapCount;
+    DWORD           dwReserved1[11];
+    DDS_PIXELFORMAT ddspf;
+    DWORD           dwCaps;
+    DWORD           dwCaps2;
+    DWORD           dwCaps3;
+    DWORD           dwCaps4;
+    DWORD           dwReserved2;
+};
+
+struct DDS_HEADER_DXT10 {
+    DXGI_FORMAT dxgiFormat;
+    DWORD       resourceDimension;
+    UINT        miscFlag;
+    UINT        arraySize;
+    UINT        miscFlags2;
+};
+
+#ifndef MAKEFOURCC
+#define MAKEFOURCC(ch0, ch1, ch2, ch3) \
+    ((DWORD)(BYTE)(ch0) | ((DWORD)(BYTE)(ch1) << 8) | \
+    ((DWORD)(BYTE)(ch2) << 16) | ((DWORD)(BYTE)(ch3) << 24))
+#endif
+
+#define DDS_FOURCC      0x00000004  // DDPF_FOURCC
+#define DDS_RGB         0x00000040  // DDPF_RGB
+
+HRESULT LoadTextureFromPng(ID3D11Device* pDevice, const std::wstring& filePath, UINT bindFlags, ID3D11Texture2D** ppTexture) {
+    IWICImagingFactory* pWICFactory = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pWICFactory));
+    if (FAILED(hr)) {
+        CoInitialize(nullptr);
+        hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pWICFactory));
+        if (FAILED(hr)) return hr;
+    }
+
+    IWICBitmapDecoder* pDecoder = nullptr;
+    hr = pWICFactory->CreateDecoderFromFilename(filePath.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &pDecoder);
+    if (FAILED(hr)) {
+        pWICFactory->Release();
+        return hr;
+    }
+
+    IWICBitmapFrameDecode* pFrame = nullptr;
+    hr = pDecoder->GetFrame(0, &pFrame);
+    if (FAILED(hr)) {
+        pDecoder->Release();
+        pWICFactory->Release();
+        return hr;
+    }
+
+    UINT width = 0, height = 0;
+    pFrame->GetSize(&width, &height);
+
+    IWICFormatConverter* pConverter = nullptr;
+    hr = pWICFactory->CreateFormatConverter(&pConverter);
+    if (FAILED(hr)) {
+        pFrame->Release();
+        pDecoder->Release();
+        pWICFactory->Release();
+        return hr;
+    }
+
+    hr = pConverter->Initialize(pFrame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) {
+        pConverter->Release();
+        pFrame->Release();
+        pDecoder->Release();
+        pWICFactory->Release();
+        return hr;
+    }
+
+    UINT rowPitch = width * 4;
+    UINT imageSize = rowPitch * height;
+    std::vector<BYTE> pixels(imageSize);
+    hr = pConverter->CopyPixels(nullptr, rowPitch, imageSize, pixels.data());
+    if (FAILED(hr)) {
+        pConverter->Release();
+        pFrame->Release();
+        pDecoder->Release();
+        pWICFactory->Release();
+        return hr;
+    }
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = bindFlags;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = 0;
+
+    D3D11_SUBRESOURCE_DATA initData = {};
+    initData.pSysMem = pixels.data();
+    initData.SysMemPitch = rowPitch;
+    initData.SysMemSlicePitch = imageSize;
+
+    hr = pDevice->CreateTexture2D(&desc, &initData, ppTexture);
+
+    pConverter->Release();
+    pFrame->Release();
+    pDecoder->Release();
+    pWICFactory->Release();
+    return hr;
+}
+
+HRESULT LoadTextureFromDds(ID3D11Device* pDevice, const std::wstring& filePath, UINT bindFlags, ID3D11Texture2D** ppTexture) {
+    FILE* f = nullptr;
+    _wfopen_s(&f, filePath.c_str(), L"rb");
+    if (!f) return E_FAIL;
+
+    DWORD dwMagic = 0;
+    fread(&dwMagic, 1, 4, f);
+    if (dwMagic != MAKEFOURCC('D', 'D', 'S', ' ')) {
+        fclose(f);
+        return E_FAIL;
+    }
+
+    DDS_HEADER header = {};
+    fread(&header, 1, sizeof(DDS_HEADER), f);
+
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    bool isDXT10 = false;
+    DDS_HEADER_DXT10 header10 = {};
+
+    if ((header.ddspf.dwFlags & DDS_FOURCC) && (header.ddspf.dwFourCC == MAKEFOURCC('D', 'X', '1', '0'))) {
+        fread(&header10, 1, sizeof(DDS_HEADER_DXT10), f);
+        format = header10.dxgiFormat;
+        isDXT10 = true;
+    } else if (header.ddspf.dwFlags & DDS_FOURCC) {
+        switch (header.ddspf.dwFourCC) {
+            case MAKEFOURCC('D', 'X', 'T', '1'):
+                format = DXGI_FORMAT_BC1_UNORM;
+                break;
+            case MAKEFOURCC('D', 'X', 'T', '3'):
+                format = DXGI_FORMAT_BC2_UNORM;
+                break;
+            case MAKEFOURCC('D', 'X', 'T', '5'):
+                format = DXGI_FORMAT_BC3_UNORM;
+                break;
+            case MAKEFOURCC('A', 'T', 'I', '2'):
+                format = DXGI_FORMAT_BC5_UNORM;
+                break;
+            default:
+                break;
+        }
+    } else if (header.ddspf.dwFlags & DDS_RGB) {
+        if (header.ddspf.dwRGBBitCount == 32) {
+            if (header.ddspf.dwRBitMask == 0x00ff0000 && header.ddspf.dwGBitMask == 0x0000ff00 && header.ddspf.dwBBitMask == 0x000000ff) {
+                format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            } else if (header.ddspf.dwRBitMask == 0x000000ff && header.ddspf.dwGBitMask == 0x0000ff00 && header.ddspf.dwBBitMask == 0x00ff0000) {
+                format = DXGI_FORMAT_R8G8B8A8_UNORM;
             }
         }
     }
+
+    if (format == DXGI_FORMAT_UNKNOWN) {
+        fclose(f);
+        return E_FAIL;
+    }
+
+    UINT width = header.dwWidth;
+    UINT height = header.dwHeight;
+    UINT mipLevels = max(1u, header.dwMipMapCount);
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = mipLevels;
+    desc.ArraySize = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = bindFlags;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = 0;
+
+    long currentOffset = ftell(f);
+    fseek(f, 0, SEEK_END);
+    long endOffset = ftell(f);
+    fseek(f, currentOffset, SEEK_SET);
+
+    size_t dataSize = endOffset - currentOffset;
+    std::vector<BYTE> rawData(dataSize);
+    fread(rawData.data(), 1, dataSize, f);
+    fclose(f);
+
+    std::vector<D3D11_SUBRESOURCE_DATA> initData(mipLevels);
+    size_t offset = 0;
+    UINT w = width;
+    UINT h = height;
+
+    for (UINT i = 0; i < mipLevels; ++i) {
+        size_t rowPitch = 0;
+        size_t slicePitch = 0;
+
+        if (format == DXGI_FORMAT_BC1_UNORM || format == DXGI_FORMAT_BC1_UNORM_SRGB ||
+            format == DXGI_FORMAT_BC2_UNORM || format == DXGI_FORMAT_BC2_UNORM_SRGB ||
+            format == DXGI_FORMAT_BC3_UNORM || format == DXGI_FORMAT_BC3_UNORM_SRGB ||
+            format == DXGI_FORMAT_BC4_UNORM || format == DXGI_FORMAT_BC4_SNORM ||
+            format == DXGI_FORMAT_BC5_UNORM || format == DXGI_FORMAT_BC5_SNORM ||
+            format == DXGI_FORMAT_BC6H_UF16 || format == DXGI_FORMAT_BC6H_SF16 ||
+            format == DXGI_FORMAT_BC7_UNORM || format == DXGI_FORMAT_BC7_UNORM_SRGB) {
+            
+            size_t numBlocksWide = max(1u, (w + 3) / 4);
+            size_t numBlocksHigh = max(1u, (h + 3) / 4);
+            size_t bytesPerBlock = (format == DXGI_FORMAT_BC1_UNORM || format == DXGI_FORMAT_BC1_UNORM_SRGB || format == DXGI_FORMAT_BC4_UNORM || format == DXGI_FORMAT_BC4_SNORM) ? 8 : 16;
+            rowPitch = numBlocksWide * bytesPerBlock;
+            slicePitch = rowPitch * numBlocksHigh;
+        } else {
+            size_t bpp = 32;
+            rowPitch = (w * bpp + 7) / 8;
+            slicePitch = rowPitch * h;
+        }
+
+        if (offset + slicePitch > dataSize) {
+            return E_FAIL;
+        }
+
+        initData[i].pSysMem = rawData.data() + offset;
+        initData[i].SysMemPitch = (UINT)rowPitch;
+        initData[i].SysMemSlicePitch = (UINT)slicePitch;
+
+        offset += slicePitch;
+        w = max(1u, w / 2);
+        h = max(1u, h / 2);
+    }
+
+    return pDevice->CreateTexture2D(&desc, initData.data(), ppTexture);
+}
+
+std::wstring ResolveTextureOverride(const std::wstring& assetName) {
+    if (assetName.empty()) return L"";
+    
+    std::wstring baseName = assetName;
+    size_t dotPos = baseName.rfind(L'.');
+    if (dotPos != std::wstring::npos) {
+        baseName = baseName.substr(0, dotPos);
+    }
+
+    for (const auto& modFolder : g_ActiveMods) {
+        // 1. Check under /textures/
+        std::wstring pngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\textures\\" + baseName + L".png";
+        if (FileExists(pngPath)) return pngPath;
+
+        std::wstring ddsPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\textures\\" + baseName + L".dds";
+        if (FileExists(ddsPath)) return ddsPath;
+
+        // 2. Check under /battle/ (specifically for battle stages/assets)
+        std::wstring battlePngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\battle\\" + baseName + L".png";
+        if (FileExists(battlePngPath)) return battlePngPath;
+
+        std::wstring battleDdsPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\battle\\" + baseName + L".dds";
+        if (FileExists(battleDdsPath)) return battleDdsPath;
+    }
+    return L"";
+}
+
+HRESULT LoadOverrideTexture(ID3D11Device* pDevice, const std::wstring& filePath, UINT bindFlags, ID3D11Texture2D** ppTexture) {
+    std::wstring ext = filePath.substr(filePath.rfind(L'.'));
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+
+    if (ext == L".png") {
+        return LoadTextureFromPng(pDevice, filePath, bindFlags, ppTexture);
+    } else if (ext == L".dds") {
+        return LoadTextureFromDds(pDevice, filePath, bindFlags, ppTexture);
+    }
+    return E_FAIL;
+}
+
+HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
+    ID3D11Device* This,
+    const D3D11_TEXTURE2D_DESC* pDesc,
+    const D3D11_SUBRESOURCE_DATA* pInitialData,
+    ID3D11Texture2D** ppTexture2D
+) {
+    if (t_InHookCreateTexture2D) {
+        return OriginalCreateTexture2D(This, pDesc, pInitialData, ppTexture2D);
+    }
+    t_InHookCreateTexture2D = true;
+
+    std::wstring assetName = L"";
+    if (pDesc) {
+        if (!g_LastLoadedTexFile.empty()) {
+            if (pDesc->Usage == 2 || pDesc->Usage == 3) {
+                assetName = g_LastLoadedTexFile;
+            } else if (pDesc->Usage == 0 || pDesc->Usage == 1) {
+                assetName = g_LastLoadedTexFile;
+                g_LastLoadedTexFile = L""; // Clear character texture tracking!
+            }
+        } else if (!g_ActiveStageName.empty() && g_MaxStageTextures > 0) {
+            if (pDesc->Usage == 2 && pDesc->BindFlags == 8 && g_StageTextureCounter < g_MaxStageTextures) {
+                wchar_t stageTexName[64];
+                swprintf_s(stageTexName, L"%s_T%02d_00", g_ActiveStageName.c_str(), g_StageTextureCounter);
+                g_CurrentStageTexName = stageTexName;
+                g_StageTextureCounter++;
+                assetName = g_CurrentStageTexName;
+            } else if (pDesc->Usage == 0 && !g_CurrentStageTexName.empty() && pDesc->BindFlags == 40) {
+                assetName = g_CurrentStageTexName;
+                g_CurrentStageTexName = L""; // Consume and clear immediately to prevent matching subsequent static textures!
+            }
+        }
+
+        if (!assetName.empty()) {
+            LogTexture("[D3D11] CreateTexture2D: Asset=%S, Width=%u, Height=%u, MipLevels=%u, ArraySize=%u, Format=%u, SampleDescCount=%u, SampleDescQuality=%u, Usage=%u, BindFlags=%u, CPUAccessFlags=%u, MiscFlags=%u\n",
+                assetName.c_str(), pDesc->Width, pDesc->Height, pDesc->MipLevels, pDesc->ArraySize, pDesc->Format,
+                pDesc->SampleDesc.Count, pDesc->SampleDesc.Quality, pDesc->Usage, pDesc->BindFlags,
+                pDesc->CPUAccessFlags, pDesc->MiscFlags);
+        } else {
+            LogTexture("[D3D11] CreateTexture2D: Asset=UNKNOWN, Width=%u, Height=%u, MipLevels=%u, ArraySize=%u, Format=%u, SampleDescCount=%u, SampleDescQuality=%u, Usage=%u, BindFlags=%u, CPUAccessFlags=%u, MiscFlags=%u\n",
+                pDesc->Width, pDesc->Height, pDesc->MipLevels, pDesc->ArraySize, pDesc->Format,
+                pDesc->SampleDesc.Count, pDesc->SampleDesc.Quality, pDesc->Usage, pDesc->BindFlags,
+                pDesc->CPUAccessFlags, pDesc->MiscFlags);
+        }
+    }
+    HRESULT hr = OriginalCreateTexture2D(This, pDesc, pInitialData, ppTexture2D);
+    if (SUCCEEDED(hr) && ppTexture2D && *ppTexture2D && !assetName.empty()) {
+        std::wstring overridePath = ResolveTextureOverride(assetName);
+        if (!overridePath.empty()) {
+            if (pDesc->Usage == 0) {
+                ID3D11Texture2D* pOverrideTex = nullptr;
+                HRESULT hrLoad = LoadOverrideTexture(This, overridePath, pDesc->BindFlags, &pOverrideTex);
+                if (SUCCEEDED(hrLoad) && pOverrideTex) {
+                    (*ppTexture2D)->Release();
+                    *ppTexture2D = pOverrideTex;
+                    Log("[Loader] Swapped static texture %S in CreateTexture2D: Override=%p\n", assetName.c_str(), pOverrideTex);
+                } else {
+                    Log("[Loader] ERROR: LoadOverrideTexture failed for path %S: 0x%08X\n", overridePath.c_str(), hrLoad);
+                }
+            }
+        }
+    }
+    t_InHookCreateTexture2D = false;
     return hr;
 }
 
@@ -382,6 +780,14 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
     D3D_FEATURE_LEVEL* pFeatureLevel,
     ID3D11DeviceContext** ppImmediateContext
 ) {
+    if (g_DisableD3D11Hooks) {
+        Log("[Loader] D3D11 Hooks disabled in mods_loader.ini. Bypassing D3D11 hooks.\n");
+        return OriginalD3D11CreateDeviceAndSwapChain(
+            pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels,
+            SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext
+        );
+    }
+
     Log("[Loader] D3D11CreateDeviceAndSwapChain intercepted! ppSwapChain: %p, ppDevice: %p\n", ppSwapChain, ppDevice);
     HRESULT hr = OriginalD3D11CreateDeviceAndSwapChain(
         pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels,
@@ -390,24 +796,24 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
     Log("[Loader] Original D3D11CreateDeviceAndSwapChain returned: 0x%08X\n", hr);
     
     if (SUCCEEDED(hr)) {
+        if (ppDevice && *ppDevice) {
+            ID3D11Device* pDevice = *ppDevice;
+            if (!OriginalCreateTexture2D) {
+                Log("[Loader] Hooking ID3D11Device::CreateTexture2D via VMT...\n");
+                OriginalCreateTexture2D = (CreateTexture2D_t)HookVMT(pDevice, 5, HookedCreateTexture2D);
+                Log("[Loader] ID3D11Device::CreateTexture2D Hooked via VMT! Original: %p\n", OriginalCreateTexture2D);
+            }
+        }
         if (ppSwapChain && *ppSwapChain) {
             IDXGISwapChain* pSwapChain = *ppSwapChain;
             if (!OriginalPresent) {
-                void** pVMT = *(void***)pSwapChain;
-                void* pPresent = pVMT[8];
-                Log("[Loader] Game SwapChain created directly! Hooking Present (%p)...\n", pPresent);
-
-                MH_STATUS status = MH_CreateHook(pPresent, (LPVOID)&HookedPresent, (LPVOID*)&OriginalPresent);
-                if (status == MH_OK) {
-                    MH_STATUS enableStatus = MH_EnableHook(pPresent);
-                    Log("[Loader] D3D11 SwapChain Present Hooked successfully! Status: %d\n", enableStatus);
-                } else {
-                    Log("[Loader] Failed to hook Present. Error: %d\n", status);
-                }
+                Log("[Loader] Hooking IDXGISwapChain::Present via VMT...\n");
+                OriginalPresent = (IDXGISwapChainPresent_t)HookVMT(pSwapChain, 8, HookedPresent);
+                Log("[Loader] IDXGISwapChain::Present Hooked via VMT! Original: %p\n", OriginalPresent);
             }
         } else if (ppDevice && *ppDevice) {
             ID3D11Device* pDevice = *ppDevice;
-            Log("[Loader] Device created without SwapChain. Attempting to query DXGI Factory to hook SwapChain creation...\n");
+            Log("[Loader] Device created without SwapChain. Hooking DXGI Factory...\n");
             
             IDXGIDevice* pDxgiDevice = nullptr;
             if (SUCCEEDED(pDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&pDxgiDevice)) && pDxgiDevice) {
@@ -416,32 +822,15 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
                     IDXGIFactory* pDxgiFactory = nullptr;
                     if (SUCCEEDED(pDxgiAdapter->GetParent(__uuidof(IDXGIFactory), (void**)&pDxgiFactory)) && pDxgiFactory) {
                         if (!OriginalCreateSwapChain) {
-                            void** pVMT = *(void***)pDxgiFactory;
-                            void* pCreateSwapChain = pVMT[10];
-                            Log("[Loader] Hooking IDXGIFactory::CreateSwapChain (%p) dynamically...\n", pCreateSwapChain);
-                            
-                            MH_STATUS status = MH_CreateHook(pCreateSwapChain, (LPVOID)&HookedCreateSwapChain, (LPVOID*)&OriginalCreateSwapChain);
-                            if (status == MH_OK) {
-                                MH_STATUS enableStatus = MH_EnableHook(pCreateSwapChain);
-                                Log("[Loader] IDXGIFactory::CreateSwapChain Hooked successfully! Status: %d\n", enableStatus);
-                            } else {
-                                Log("[Loader] Failed to hook CreateSwapChain. Error: %d\n", status);
-                            }
+                            Log("[Loader] Hooking IDXGIFactory::CreateSwapChain via VMT...\n");
+                            OriginalCreateSwapChain = (IDXGIFactoryCreateSwapChain_t)HookVMT(pDxgiFactory, 10, HookedCreateSwapChain);
+                            Log("[Loader] IDXGIFactory::CreateSwapChain Hooked via VMT! Original: %p\n", OriginalCreateSwapChain);
 
-                            // Also try to hook IDXGIFactory2::CreateSwapChainForHwnd (index 15)
                             IDXGIFactory2* pDxgiFactory2 = nullptr;
                             if (SUCCEEDED(pDxgiFactory->QueryInterface(__uuidof(IDXGIFactory2), (void**)&pDxgiFactory2)) && pDxgiFactory2) {
-                                void** pVMT2 = *(void***)pDxgiFactory2;
-                                void* pCreateSwapChainForHwnd = pVMT2[15];
-                                Log("[Loader] Hooking IDXGIFactory2::CreateSwapChainForHwnd (%p) dynamically...\n", pCreateSwapChainForHwnd);
-
-                                MH_STATUS status2 = MH_CreateHook(pCreateSwapChainForHwnd, (LPVOID)&HookedCreateSwapChainForHwnd, (LPVOID*)&OriginalCreateSwapChainForHwnd);
-                                if (status2 == MH_OK) {
-                                    MH_STATUS enableStatus2 = MH_EnableHook(pCreateSwapChainForHwnd);
-                                    Log("[Loader] IDXGIFactory2::CreateSwapChainForHwnd Hooked successfully! Status: %d\n", enableStatus2);
-                                } else {
-                                    Log("[Loader] Failed to hook CreateSwapChainForHwnd. Error: %d\n", status2);
-                                }
+                                Log("[Loader] Hooking IDXGIFactory2::CreateSwapChainForHwnd via VMT...\n");
+                                OriginalCreateSwapChainForHwnd = (IDXGIFactory2CreateSwapChainForHwnd_t)HookVMT(pDxgiFactory2, 15, HookedCreateSwapChainForHwnd);
+                                Log("[Loader] IDXGIFactory2::CreateSwapChainForHwnd Hooked via VMT! Original: %p\n", OriginalCreateSwapChainForHwnd);
                                 pDxgiFactory2->Release();
                             }
                         }
@@ -467,6 +856,8 @@ std::vector<std::wstring> g_ActivePlugins;
 bool g_EnableLogging = true;
 std::wstring g_LogFileName = L"mods_loader_log.txt";
 std::wstring g_LogPath = L"mods_loader_log.txt";
+std::wstring g_TextureLogFileName = L"d3d11_texture_log.txt";
+std::wstring g_TextureLogPath = L"d3d11_texture_log.txt";
 std::wstring g_IniPath = L"mods_loader.ini";
 
 bool DirectoryExists(const std::wstring& path) {
@@ -594,6 +985,15 @@ int FilenameToLookupIndex(const std::string& filename) {
 
 void PopulateVirtualLgp(const std::wstring& archiveRelPath, RedirectState& state) {
     Log("[Loader] PopulateVirtualLgp started for rel path: %S\n", archiveRelPath.c_str());
+    
+    std::wstring archiveLower = archiveRelPath;
+    std::transform(archiveLower.begin(), archiveLower.end(), archiveLower.begin(), ::towlower);
+    if (archiveLower.find(L"battle\\battle") != std::wstring::npos) {
+        g_ActiveStageName = L"";
+        g_StageTextureCounter = 0;
+        g_CurrentStageTexName = L"";
+        Log("[Loader] Reset stage sequencer for new battle.\n");
+    }
     
     struct MergedFileInfo {
         std::wstring diskName;
@@ -949,6 +1349,26 @@ void PreInitializeLogging() {
     g_LogPath = (exeSlash != std::wstring::npos) ? exeStr.substr(0, exeSlash) + L"\\" + g_LogFileName : g_LogFileName;
     g_IniPath = iniPath;
 
+    // Read EnableTextureLogging (true/false)
+    wchar_t texLoggingStr[32] = L"false";
+    GetPrivateProfileStringW(L"Loader", L"EnableTextureLogging", L"false", texLoggingStr, 32, iniPath.c_str());
+    std::wstring texLogStrLower = texLoggingStr;
+    std::transform(texLogStrLower.begin(), texLogStrLower.end(), texLogStrLower.begin(), ::towlower);
+    g_EnableTextureLogging = (texLogStrLower == L"true");
+
+    // Read TextureLogFile
+    wchar_t texLogFile[MAX_PATH] = L"d3d11_texture_log.txt";
+    GetPrivateProfileStringW(L"Loader", L"TextureLogFile", L"d3d11_texture_log.txt", texLogFile, MAX_PATH, iniPath.c_str());
+    g_TextureLogFileName = texLogFile;
+    g_TextureLogPath = (exeSlash != std::wstring::npos) ? exeStr.substr(0, exeSlash) + L"\\" + g_TextureLogFileName : g_TextureLogFileName;
+
+    // Read DisableD3D11Hooks
+    wchar_t disableHooksStr[32] = L"false";
+    GetPrivateProfileStringW(L"Loader", L"DisableD3D11Hooks", L"false", disableHooksStr, 32, iniPath.c_str());
+    std::wstring disableHooksLower = disableHooksStr;
+    std::transform(disableHooksLower.begin(), disableHooksLower.end(), disableHooksLower.begin(), ::towlower);
+    g_DisableD3D11Hooks = (disableHooksLower == L"true");
+
     if (g_EnableLogging) {
         FILE* f = NULL;
         _wfopen_s(&f, g_LogPath.c_str(), L"w");
@@ -956,6 +1376,12 @@ void PreInitializeLogging() {
             fprintf(f, "[Loader] === Log Initialized (Fresh Start) ===\n");
             fclose(f);
         }
+    }
+
+    if (g_EnableTextureLogging) {
+        FILE* fTex = NULL;
+        _wfopen_s(&fTex, g_TextureLogPath.c_str(), L"w");
+        if (fTex) fclose(fTex);
     }
 }
 
@@ -1442,6 +1868,16 @@ FILE* HookedFopen(const char* filename, const char* mode) {
             std::wstring originalPath = pathStr;
             std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
 
+            // Track texture filename if opening a loose .tex file
+            if (pathStr.find(L".tex") != std::wstring::npos) {
+                size_t lastSlash = pathStr.rfind(L'\\');
+                if (lastSlash != std::wstring::npos) {
+                    g_LastLoadedTexFile = pathStr.substr(lastSlash + 1);
+                } else {
+                    g_LastLoadedTexFile = pathStr;
+                }
+            }
+
             std::wstring splashOverride = L"";
             if (pathStr.find(L"dotemu-logo.png") != std::wstring::npos) {
                 splashOverride = GetSplashOverridePath(pathStr, originalPath, 101, L"dotemu.png");
@@ -1599,6 +2035,16 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
             std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
             std::wstring originalPath = pathStr;
             std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
+
+            // Track texture filename if opening a loose .tex file
+            if (pathStr.find(L".tex") != std::wstring::npos) {
+                size_t lastSlash = pathStr.rfind(L'\\');
+                if (lastSlash != std::wstring::npos) {
+                    g_LastLoadedTexFile = pathStr.substr(lastSlash + 1);
+                } else {
+                    g_LastLoadedTexFile = pathStr;
+                }
+            }
 
             std::wstring splashOverride = L"";
             if (pathStr.find(L"dotemu-logo.png") != std::wstring::npos) {
@@ -1795,6 +2241,60 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
     // 3. Handle redirection status update based on the identified entry
     if (foundEntry) {
         const LgpEntry& entry = *foundEntry;
+        
+        // Track the last loaded texture file name for correlation
+        std::wstring entryNameLower = entry.diskName;
+        std::transform(entryNameLower.begin(), entryNameLower.end(), entryNameLower.begin(), ::towlower);
+        
+        std::wstring archivePathLower = state.archivePath;
+        std::transform(archivePathLower.begin(), archivePathLower.end(), archivePathLower.begin(), ::towlower);
+        if (archivePathLower.find(L"battle.lgp") != std::wstring::npos) {
+            if (entry.name.length() >= 2) {
+                char prefix1 = entry.name[0];
+                char prefix2 = entry.name[1];
+                if (prefix1 >= 'a' && prefix1 <= 'z' && prefix2 >= 'a' && prefix2 <= 'z') {
+                    int stageIndex = (prefix1 - 'a') * 26 + (prefix2 - 'a');
+                    if (stageIndex >= 0 && stageIndex <= 89) {
+                        wchar_t stageBuf[32];
+                        swprintf_s(stageBuf, L"STAGE%02d", stageIndex);
+                        std::wstring stageName = stageBuf;
+                        bool isMasterFile = (entry.name.length() >= 4 && entry.name.substr(entry.name.length() - 2) == "aa");
+                        if (stageName != g_ActiveStageName || isMasterFile) {
+                            g_ActiveStageName = stageName;
+                            g_StageTextureCounter = 0;
+                            g_CurrentStageTexName = L"";
+                            g_LastLoadedTexFile = L""; // Clear character texture tracking
+                            
+                            // Calculate max stage textures in active mods
+                            g_MaxStageTextures = 0;
+                            for (const auto& mod : g_ActiveMods) {
+                                std::wstring modBattleDir = g_ModsDirectory + L"\\" + mod + L"\\battle";
+                                for (int i = 0; i < 99; i++) {
+                                    wchar_t fileBuf[MAX_PATH];
+                                    swprintf_s(fileBuf, L"%s\\%s_T%02d_00.dds", modBattleDir.c_str(), g_ActiveStageName.c_str(), i);
+                                    if (FileExists(fileBuf)) {
+                                        if (i + 1 > g_MaxStageTextures) {
+                                            g_MaxStageTextures = i + 1;
+                                        }
+                                    }
+                                    swprintf_s(fileBuf, L"%s\\%s_T%02d_00.png", modBattleDir.c_str(), g_ActiveStageName.c_str(), i);
+                                    if (FileExists(fileBuf)) {
+                                        if (i + 1 > g_MaxStageTextures) {
+                                            g_MaxStageTextures = i + 1;
+                                        }
+                                    }
+                                }
+                            }
+                            Log("[Loader] Active battle stage set to: %S (due to entry %s, isMaster=%d) - Max override textures: %d\n", g_ActiveStageName.c_str(), entry.name.c_str(), isMasterFile, g_MaxStageTextures);
+                        }
+                    }
+                }
+            }
+        } else {
+            if (entryNameLower.find(L".tex") != std::wstring::npos) {
+                g_LastLoadedTexFile = entryNameLower;
+            }
+        }
         
         // If we are switching to a different entry, close the previous override file
         if (entry.name != state.activeEntryName) {

@@ -1,25 +1,41 @@
-# FFVIISE Mod Loader - v1.1.0 Release Notes
+# FFVIISE Mod Loader - Changelog
 
-A major upgrade focused on asset conflict resolution, load order customization, and developer ease of use.
+## [v3.0.0-alpha] (Current Development)
+### Added
+- **Direct3D 11 Texture Interception**: Hooked the virtual method table (VMT) of `ID3D11Device` at index `5` to intercept `CreateTexture2D` calls.
+- **Isolated Texture Logger**: Redirected texture creation parameters (dimensions, formats, mipmap levels, and flags) to a separate log file `d3d11_texture_log.txt` to keep the main loader log clean and prevent performance impact.
+- **Texture Asset Filename Correlation**: Implemented thread-local tracking (`g_LastLoadedTexFile`) across LGP archives and loose file reads to correlate D3D11 runtime texture creations back to their game asset names.
+- **Session-Based Texture Truncation**: Truncates `d3d11_texture_log.txt` at startup so texture logging stays fresh for each gameplay session.
+- **EnableTextureLogging Switch**: Added `EnableTextureLogging=true/false` config parameter to `mods_loader.ini` (defaults to `false`), allowing developers to turn texture logging on/off dynamically to prevent overhead.
+- **Customizable Texture Log Filename**: Added `TextureLogFile=d3d11_texture_log.txt` parameter in `mods_loader.ini` so that developers can rename the output texture log file.
+- **WIC PNG/JPG Decoder**: Integrated Windows Imaging Component (WIC) to natively decode custom PNG textures into standard `DXGI_FORMAT_R8G8B8A8_UNORM` pixel buffers.
+- **DDS Format Parser**: Implemented a lightweight DDS header parser and subresource uploader to support DirectDraw Surface (DDS) textures (including BC1, BC3, and BC7 compressed formats) directly on the GPU.
+- **Texture Override Resolution**: Resolves custom mod textures located under `mods/<ModFolder>/textures/<AssetName>.png`/`.dds` and `mods/<ModFolder>/battle/<AssetName>.png`/`.dds` according to the active mods list priority.
+- **Battle Stage Texture Sequencer**: Implemented alphabetical-to-index mapping for `battle.lgp` reads (e.g. `abab` -> `STAGE01`) and sequenced texture tracking to dynamically reconstruct embedded battle environment filenames (e.g. `STAGE01_T00_00`, `STAGE01_T01_00`). Restricted stage index lookup to 0-89 range and implemented automated stage tracker resetting when `battle.lgp` is loaded or when a new stage master file (ending in `aa`) is read to ensure perfect texture synchronization across consecutive battles.
 
-## 🚀 Key Features & Changes
+### Fixed
+- **Direct3D 11 Copy/Update Hooking (Removed)**: Removed hooks on `ID3D11DeviceContext::CopySubresourceRegion` (VMT index `46`), `ID3D11DeviceContext::CopyResource` (VMT index `47`), and `ID3D11DeviceContext::UpdateSubresource` (VMT index `48`) entirely. Removing these hooks eliminates the massive per-frame COM overhead (which was causing lag, invisible characters, and disappearing UI/font layers) and leaves the hot-path context completely untouched.
+- **Character & UI Texture Corruption (Invisible Models / Overlay Crashing / Slot Reuse)**: Transitioned D3D11 device/swapchain hooking (including `CreateTexture2D`, `Present`, `CreateSwapChain`) to VMT Hooking (Virtual Method Table pointer swaps) instead of MinHook inline byte patching. This avoids memory patching the graphics driver's instructions, ensuring 100% rendering pipeline stability and overlay compatibility. Switched to direct static texture replacement inside `CreateTexture2D` which natively assigns the HD texture and completely bypasses SRV swap complications. Matched the original texture's `BindFlags` inside our WIC/DDS override loaders to prevent Render Target mismatch binding failures that made models invisible. Fixed thread-local tracking state pollution by implementing a recursion guard inside `CreateTexture2D` and immediately clearing `g_LastLoadedTexFile` upon consuming/matching the static character/UI texture (handling all static formats with `Usage == 0 || Usage == 1`). Fixed UI and font texture hijacking by dynamically scanning active mod directories on stage change to calculate `g_MaxStageTextures` (the actual file count of the stage), and capping our stage sequencer strictly to this count. This prevents subsequent UI/font dynamic staging textures from being incorrectly renamed as stage textures. This keeps the rendering pipeline perfectly stable, restores character models and UI, and retains full overlay functionality.
 
-### 📁 Multi-Mod Subfolders & Prioritized Load Order
-* **Mod Isolation:** Mods no longer need to be merged into a single flat directory. Each mod now lives in its own subdirectory inside the `mods/` folder (e.g., `mods/TextureMod/`, `mods/TranslateMod/`), preventing file conflicts.
-* **Priority Loader (`load_order.txt`):** Added a load priority list. Mod folders listed at the top of `mods/load_order.txt` have the highest priority and will override matching assets in folders below them.
-* **Auto-Discovery & Appending:** 
-  * If `load_order.txt` is missing, it will auto-create and populate it with all discovered folders alphabetically.
-  * When you add a new mod directory later, the loader automatically detects it and appends it to the bottom of `load_order.txt` (lowest priority) so your custom load order is never broken.
+---
 
-### 🖼️ Configurable Splash Screens
-* **SplashScreens Option:** Added a configurable key in `mods_loader.ini` to customize the game's startup screens (`dotemu-logo.png`, `finelogo.png`, `press_start.png`):
-  * `custom`: Always loads the custom splash screens embedded directly inside the DLL (ignores the mods folder).
-  * `default`: Checks your active mods folder for replacements first, falling back to original game splash screens if none are found.
+## [v2.0.0] - Stable Release
+### Added
+- **Virtual LGP Asset Merger**: Restructured the LGP archive reader to dynamically merge physical `.lgp` archives on disk with loose overrides in active mod folders (such as `char.lgp` and custom `.tex` assets).
+- **Physical Fallback Mode**: Base game assets are loaded directly from the original LGP archives at their native offsets, bypassing massive file copies to disk and preserving memory/disk bandwidth.
 
-### 📝 Auto-Clearing Logs
-* **Session Logging:** The log file (`mods_loader_log.txt`) is now truncated/cleared on every fresh game startup. It will no longer grow indefinitely, keeping logs clean and relevant for your current session.
+### Fixed
+- **Flattened Mod Temp Directory**: Modified the virtual archive generator to replace directory paths with flat filenames (e.g. `field\char` -> `field_char.tmp`), preventing failures where subdirectories did not exist in the mod folder.
+- **CRT Buffering Integrity**: Disabled redirection mechanisms for unmodified physical archives (`flevel.lgp`, `magic.lgp`, etc.) to align with native game buffering and prevent crashes during save loading or scene transitions.
+- **Windows Store Edition Logging Order**: Fixed log initialization sequence to prevent mod discovery and configuration startup logs from being truncated.
 
-### 🛠️ Interactive Developer Tool (`run.bat`)
-* **Dual-Option Menu:** Refactored the helper script into an interactive menu. Launching it now prompts you to choose between:
-  1. Compiling the mod loader `d3d11.dll` (includes embedding assets compiled via `rc.exe` and `resources.res`).
-  2. Pushing all changes directly to GitHub with a custom or default commit message.
+---
+
+## [v1.1.0] - Release Notes
+### Key Features & Changes
+- **Multi-Mod Subfolders & Prioritized Load Order**:
+  - Mod folders are isolated under `mods/` (e.g., `mods/TextureMod/`, `mods/TranslateMod/`).
+  - Implemented load priority order list via `mods/load_order.txt`.
+- **Configurable Splash Screens**: Added `SplashScreens=default/custom/mods` options in `mods_loader.ini`.
+- **Session Logging**: Truncates `mods_loader_log.txt` on every fresh startup.
+- **Interactive Developer Tool (`run.bat`)**: Rebuilt compilation and GitHub pushing helper script menu.
