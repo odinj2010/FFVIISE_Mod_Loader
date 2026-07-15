@@ -818,16 +818,13 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 g_CurrentStageTexName = L""; // Consume and clear immediately to prevent matching subsequent static textures!
             }
         } else if (!g_ActiveFieldName.empty() && !g_ActiveFieldTexIndices.empty()) {
-            if (pDesc->Usage == 2 && pDesc->BindFlags == 8 && g_FieldTextureCounter < g_ActiveFieldTexIndices.size()) {
+            if (pDesc->Usage == 0 && pDesc->BindFlags == 40 && g_FieldTextureCounter < g_ActiveFieldTexIndices.size()) {
                 int actualIndex = g_ActiveFieldTexIndices[g_FieldTextureCounter];
                 wchar_t fieldTexName[128];
                 swprintf_s(fieldTexName, L"%s_%02d_00", g_ActiveFieldName.c_str(), actualIndex);
                 g_CurrentFieldTexName = fieldTexName;
                 g_FieldTextureCounter++;
                 assetName = g_CurrentFieldTexName;
-            } else if (pDesc->Usage == 0 && !g_CurrentFieldTexName.empty() && pDesc->BindFlags == 40) {
-                assetName = g_CurrentFieldTexName;
-                g_CurrentFieldTexName = L""; // Consume and clear immediately
             }
         }
 
