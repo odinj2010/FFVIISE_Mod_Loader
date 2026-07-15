@@ -2,7 +2,6 @@
 #include <windows.h>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <mutex>
 #include <algorithm>
@@ -41,50 +40,6 @@ typedef HRESULT(STDMETHODCALLTYPE* CreateTexture2D_t)(
 );
 CreateTexture2D_t OriginalCreateTexture2D = nullptr;
 
-typedef void (STDMETHODCALLTYPE* CopySubresourceRegion_t)(
-    ID3D11DeviceContext* This,
-    ID3D11Resource* pDstResource,
-    UINT DstSubresource,
-    UINT DstX,
-    UINT DstY,
-    UINT DstZ,
-    ID3D11Resource* pSrcResource,
-    UINT SrcSubresource,
-    const D3D11_BOX* pSrcBox
-);
-CopySubresourceRegion_t OriginalCopySubresourceRegion = nullptr;
-
-typedef void (STDMETHODCALLTYPE* UpdateSubresource_t)(
-    ID3D11DeviceContext* This,
-    ID3D11Resource* pDstResource,
-    UINT DstSubresource,
-    const D3D11_BOX* pDstBox,
-    const void* pSrcData,
-    UINT SrcRowPitch,
-    UINT SrcDepthPitch
-);
-UpdateSubresource_t OriginalUpdateSubresource = nullptr;
-
-std::unordered_set<ID3D11Resource*> g_SwappedResources;
-std::mutex g_SwappedResourcesMutex;
-
-typedef HRESULT (STDMETHODCALLTYPE* Map_t)(
-    ID3D11DeviceContext* This,
-    ID3D11Resource* pResource,
-    UINT Subresource,
-    D3D11_MAP MapType,
-    UINT MapFlags,
-    D3D11_MAPPED_SUBRESOURCE* pMappedResource
-);
-Map_t OriginalMap = nullptr;
-
-typedef void (STDMETHODCALLTYPE* Unmap_t)(
-    ID3D11DeviceContext* This,
-    ID3D11Resource* pResource,
-    UINT Subresource
-);
-Unmap_t OriginalUnmap = nullptr;
-
 typedef HRESULT(WINAPI* D3D11CreateDeviceAndSwapChain_t)(
     IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
     const D3D_FEATURE_LEVEL*, UINT, UINT,
@@ -104,98 +59,6 @@ void* HookVMT(void* pInstance, int index, void* pHookFunc) {
         VirtualProtect(&pVMT[index], sizeof(void*), oldProtect, &oldProtect);
     }
     return pOriginal;
-}
-
-void STDMETHODCALLTYPE HookedCopySubresourceRegion(
-    ID3D11DeviceContext* This,
-    ID3D11Resource* pDstResource,
-    UINT DstSubresource,
-    UINT DstX,
-    UINT DstY,
-    UINT DstZ,
-    ID3D11Resource* pSrcResource,
-    UINT SrcSubresource,
-    const D3D11_BOX* pSrcBox
-) {
-    bool isSwapped = false;
-    {
-        std::lock_guard<std::mutex> lock(g_SwappedResourcesMutex);
-        if (g_SwappedResources.count(pDstResource) > 0) {
-            isSwapped = true;
-        }
-    }
-    if (isSwapped) {
-        return;
-    }
-    OriginalCopySubresourceRegion(This, pDstResource, DstSubresource, DstX, DstY, DstZ, pSrcResource, SrcSubresource, pSrcBox);
-}
-
-void STDMETHODCALLTYPE HookedUpdateSubresource(
-    ID3D11DeviceContext* This,
-    ID3D11Resource* pDstResource,
-    UINT DstSubresource,
-    const D3D11_BOX* pDstBox,
-    const void* pSrcData,
-    UINT SrcRowPitch,
-    UINT SrcDepthPitch
-) {
-    bool isSwapped = false;
-    {
-        std::lock_guard<std::mutex> lock(g_SwappedResourcesMutex);
-        if (g_SwappedResources.count(pDstResource) > 0) {
-            isSwapped = true;
-        }
-    }
-    if (isSwapped) {
-        return;
-    }
-    OriginalUpdateSubresource(This, pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
-}
-
-static uint8_t g_DummyMapBuffer[4 * 1024 * 1024];
-
-HRESULT STDMETHODCALLTYPE HookedMap(
-    ID3D11DeviceContext* This,
-    ID3D11Resource* pResource,
-    UINT Subresource,
-    D3D11_MAP MapType,
-    UINT MapFlags,
-    D3D11_MAPPED_SUBRESOURCE* pMappedResource
-) {
-    bool isSwapped = false;
-    {
-        std::lock_guard<std::mutex> lock(g_SwappedResourcesMutex);
-        if (g_SwappedResources.count(pResource) > 0) {
-            isSwapped = true;
-        }
-    }
-    if (isSwapped) {
-        if (pMappedResource) {
-            pMappedResource->pData = g_DummyMapBuffer;
-            pMappedResource->RowPitch = 4096;
-            pMappedResource->DepthPitch = 4096 * 1024;
-        }
-        return S_OK;
-    }
-    return OriginalMap(This, pResource, Subresource, MapType, MapFlags, pMappedResource);
-}
-
-void STDMETHODCALLTYPE HookedUnmap(
-    ID3D11DeviceContext* This,
-    ID3D11Resource* pResource,
-    UINT Subresource
-) {
-    bool isSwapped = false;
-    {
-        std::lock_guard<std::mutex> lock(g_SwappedResourcesMutex);
-        if (g_SwappedResources.count(pResource) > 0) {
-            isSwapped = true;
-        }
-    }
-    if (isSwapped) {
-        return;
-    }
-    OriginalUnmap(This, pResource, Subresource);
 }
 
 HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
@@ -220,15 +83,12 @@ thread_local std::wstring g_LastLoadedTexFile = L"";
 thread_local bool t_InHookCreateTexture2D = false;
 std::wstring g_ActiveStageName = L"";
 int g_StageTextureCounter = 0;
-std::vector<int> g_ActiveStageTexIndices;
+int g_MaxStageTextures = 0;
 std::wstring g_CurrentStageTexName = L"";
-std::wstring g_ActiveFieldName = L"";
-int g_FieldStaticCounter = 0;
-int g_FieldDynamicCounter = 0;
-std::vector<int> g_ActiveFieldTexIndices;
-std::wstring g_CurrentFieldTexName = L"";
 bool g_EnableTextureLogging = false;
 bool g_DisableD3D11Hooks = false;
+// Direct3D 11 Context hook declarations removed
+
 extern std::wstring g_TextureLogPath;
 extern std::vector<std::wstring> g_ActiveMods;
 extern std::vector<std::wstring> g_ActivePlugins;
@@ -811,23 +671,14 @@ std::wstring ResolveTextureOverride(const std::wstring& assetName) {
     }
 
     for (const auto& modFolder : g_ActiveMods) {
-        // 1. Check under /field/<fieldName>/
-        if (!g_ActiveFieldName.empty()) {
-            std::wstring fieldPngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\field\\" + g_ActiveFieldName + L"\\" + baseName + L".png";
-            if (FileExists(fieldPngPath)) return fieldPngPath;
-
-            std::wstring fieldDdsPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\field\\" + g_ActiveFieldName + L"\\" + baseName + L".dds";
-            if (FileExists(fieldDdsPath)) return fieldDdsPath;
-        }
-
-        // 2. Check under /textures/
+        // 1. Check under /textures/
         std::wstring pngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\textures\\" + baseName + L".png";
         if (FileExists(pngPath)) return pngPath;
 
         std::wstring ddsPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\textures\\" + baseName + L".dds";
         if (FileExists(ddsPath)) return ddsPath;
 
-        // 3. Check under /battle/ (specifically for battle stages/assets)
+        // 2. Check under /battle/ (specifically for battle stages/assets)
         std::wstring battlePngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\battle\\" + baseName + L".png";
         if (FileExists(battlePngPath)) return battlePngPath;
 
@@ -869,33 +720,16 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 assetName = g_LastLoadedTexFile;
                 g_LastLoadedTexFile = L""; // Clear character texture tracking!
             }
-        } else if (!g_ActiveStageName.empty() && !g_ActiveStageTexIndices.empty()) {
-            if (pDesc->Usage == 2 && pDesc->BindFlags == 8 && g_StageTextureCounter < g_ActiveStageTexIndices.size()) {
-                int actualIndex = g_ActiveStageTexIndices[g_StageTextureCounter];
+        } else if (!g_ActiveStageName.empty() && g_MaxStageTextures > 0) {
+            if (pDesc->Usage == 2 && pDesc->BindFlags == 8 && g_StageTextureCounter < g_MaxStageTextures) {
                 wchar_t stageTexName[64];
-                swprintf_s(stageTexName, L"%s_T%02d_00", g_ActiveStageName.c_str(), actualIndex);
+                swprintf_s(stageTexName, L"%s_T%02d_00", g_ActiveStageName.c_str(), g_StageTextureCounter);
                 g_CurrentStageTexName = stageTexName;
                 g_StageTextureCounter++;
                 assetName = g_CurrentStageTexName;
             } else if (pDesc->Usage == 0 && !g_CurrentStageTexName.empty() && pDesc->BindFlags == 40) {
                 assetName = g_CurrentStageTexName;
                 g_CurrentStageTexName = L""; // Consume and clear immediately to prevent matching subsequent static textures!
-            }
-        } else if (!g_ActiveFieldName.empty() && !g_ActiveFieldTexIndices.empty()) {
-            if (pDesc->Usage == 0 && pDesc->BindFlags == 40 && g_FieldStaticCounter < g_ActiveFieldTexIndices.size()) {
-                int actualIndex = g_ActiveFieldTexIndices[g_FieldStaticCounter];
-                wchar_t fieldTexName[128];
-                swprintf_s(fieldTexName, L"%s_%02d_00", g_ActiveFieldName.c_str(), actualIndex);
-                g_CurrentFieldTexName = fieldTexName;
-                g_FieldStaticCounter++;
-                assetName = g_CurrentFieldTexName;
-            } else if (pDesc->Usage == 2 && pDesc->BindFlags == 8 && g_FieldDynamicCounter < g_ActiveFieldTexIndices.size()) {
-                int actualIndex = g_ActiveFieldTexIndices[g_FieldDynamicCounter];
-                wchar_t fieldTexName[128];
-                swprintf_s(fieldTexName, L"%s_%02d_00", g_ActiveFieldName.c_str(), actualIndex);
-                g_CurrentFieldTexName = fieldTexName;
-                g_FieldDynamicCounter++;
-                assetName = g_CurrentFieldTexName;
             }
         }
 
@@ -915,19 +749,13 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
     if (SUCCEEDED(hr) && ppTexture2D && *ppTexture2D && !assetName.empty()) {
         std::wstring overridePath = ResolveTextureOverride(assetName);
         if (!overridePath.empty()) {
-            if (pDesc->Usage == 0 || pDesc->Usage == 2) {
+            if (pDesc->Usage == 0) {
                 ID3D11Texture2D* pOverrideTex = nullptr;
                 HRESULT hrLoad = LoadOverrideTexture(This, overridePath, pDesc->BindFlags, &pOverrideTex);
                 if (SUCCEEDED(hrLoad) && pOverrideTex) {
                     (*ppTexture2D)->Release();
                     *ppTexture2D = pOverrideTex;
-                    
-                    {
-                        std::lock_guard<std::mutex> lock(g_SwappedResourcesMutex);
-                        g_SwappedResources.insert(pOverrideTex);
-                    }
-                    
-                    Log("[Loader] Swapped texture %S (Usage=%d) in CreateTexture2D: Override=%p\n", assetName.c_str(), pDesc->Usage, pOverrideTex);
+                    Log("[Loader] Swapped static texture %S in CreateTexture2D: Override=%p\n", assetName.c_str(), pOverrideTex);
                 } else {
                     Log("[Loader] ERROR: LoadOverrideTexture failed for path %S: 0x%08X\n", overridePath.c_str(), hrLoad);
                 }
@@ -974,29 +802,6 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
                 Log("[Loader] Hooking ID3D11Device::CreateTexture2D via VMT...\n");
                 OriginalCreateTexture2D = (CreateTexture2D_t)HookVMT(pDevice, 5, HookedCreateTexture2D);
                 Log("[Loader] ID3D11Device::CreateTexture2D Hooked via VMT! Original: %p\n", OriginalCreateTexture2D);
-            }
-        }
-        if (ppImmediateContext && *ppImmediateContext) {
-            ID3D11DeviceContext* pContext = *ppImmediateContext;
-            if (!OriginalCopySubresourceRegion) {
-                Log("[Loader] Hooking ID3D11DeviceContext::CopySubresourceRegion via VMT...\n");
-                OriginalCopySubresourceRegion = (CopySubresourceRegion_t)HookVMT(pContext, 46, HookedCopySubresourceRegion);
-                Log("[Loader] ID3D11DeviceContext::CopySubresourceRegion Hooked via VMT! Original: %p\n", OriginalCopySubresourceRegion);
-            }
-            if (!OriginalUpdateSubresource) {
-                Log("[Loader] Hooking ID3D11DeviceContext::UpdateSubresource via VMT...\n");
-                OriginalUpdateSubresource = (UpdateSubresource_t)HookVMT(pContext, 48, HookedUpdateSubresource);
-                Log("[Loader] ID3D11DeviceContext::UpdateSubresource Hooked via VMT! Original: %p\n", OriginalUpdateSubresource);
-            }
-            if (!OriginalMap) {
-                Log("[Loader] Hooking ID3D11DeviceContext::Map via VMT...\n");
-                OriginalMap = (Map_t)HookVMT(pContext, 14, HookedMap);
-                Log("[Loader] ID3D11DeviceContext::Map Hooked via VMT! Original: %p\n", OriginalMap);
-            }
-            if (!OriginalUnmap) {
-                Log("[Loader] Hooking ID3D11DeviceContext::Unmap via VMT...\n");
-                OriginalUnmap = (Unmap_t)HookVMT(pContext, 15, HookedUnmap);
-                Log("[Loader] ID3D11DeviceContext::Unmap Hooked via VMT! Original: %p\n", OriginalUnmap);
             }
         }
         if (ppSwapChain && *ppSwapChain) {
@@ -2460,65 +2265,29 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
                             g_CurrentStageTexName = L"";
                             g_LastLoadedTexFile = L""; // Clear character texture tracking
                             
-                             g_ActiveFieldName = L"";
-                             g_FieldStaticCounter = 0;
-                             g_FieldDynamicCounter = 0;
-                             g_CurrentFieldTexName = L"";
-                             g_ActiveFieldTexIndices.clear();
-                            
-                            // Find all texture indices for this stage in active mods
-                            g_ActiveStageTexIndices.clear();
+                            // Calculate max stage textures in active mods
+                            g_MaxStageTextures = 0;
                             for (const auto& mod : g_ActiveMods) {
                                 std::wstring modBattleDir = g_ModsDirectory + L"\\" + mod + L"\\battle";
                                 for (int i = 0; i < 99; i++) {
                                     wchar_t fileBuf[MAX_PATH];
                                     swprintf_s(fileBuf, L"%s\\%s_T%02d_00.dds", modBattleDir.c_str(), g_ActiveStageName.c_str(), i);
                                     if (FileExists(fileBuf)) {
-                                        g_ActiveStageTexIndices.push_back(i);
+                                        if (i + 1 > g_MaxStageTextures) {
+                                            g_MaxStageTextures = i + 1;
+                                        }
                                     }
                                     swprintf_s(fileBuf, L"%s\\%s_T%02d_00.png", modBattleDir.c_str(), g_ActiveStageName.c_str(), i);
                                     if (FileExists(fileBuf)) {
-                                        g_ActiveStageTexIndices.push_back(i);
+                                        if (i + 1 > g_MaxStageTextures) {
+                                            g_MaxStageTextures = i + 1;
+                                        }
                                     }
                                 }
                             }
-                            // Sort and remove duplicates
-                            std::sort(g_ActiveStageTexIndices.begin(), g_ActiveStageTexIndices.end());
-                            g_ActiveStageTexIndices.erase(std::unique(g_ActiveStageTexIndices.begin(), g_ActiveStageTexIndices.end()), g_ActiveStageTexIndices.end());
-                            Log("[Loader] Active battle stage set to: %S (due to entry %s, isMaster=%d) - Found %d override textures\n", g_ActiveStageName.c_str(), entry.name.c_str(), isMasterFile, (int)g_ActiveStageTexIndices.size());
+                            Log("[Loader] Active battle stage set to: %S (due to entry %s, isMaster=%d) - Max override textures: %d\n", g_ActiveStageName.c_str(), entry.name.c_str(), isMasterFile, g_MaxStageTextures);
                         }
                     }
-                }
-            }
-        } else if (archivePathLower.find(L"flevel.lgp") != std::wstring::npos) {
-            if (entryNameLower.find(L".") == std::wstring::npos) {
-                std::wstring fieldName = entryNameLower;
-                if (fieldName != g_ActiveFieldName) {
-                    g_ActiveFieldName = fieldName;
-                    g_FieldStaticCounter = 0;
-                    g_FieldDynamicCounter = 0;
-                    g_CurrentFieldTexName = L"";
-                    
-                    // Find all texture indices for this field in active mods
-                    g_ActiveFieldTexIndices.clear();
-                    for (const auto& mod : g_ActiveMods) {
-                        std::wstring modFieldDir = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + mod + L"\\field\\" + g_ActiveFieldName;
-                        for (int i = 0; i < 99; i++) {
-                            wchar_t fileBuf[MAX_PATH];
-                            swprintf_s(fileBuf, L"%s\\%s_%02d_00.png", modFieldDir.c_str(), g_ActiveFieldName.c_str(), i);
-                            if (FileExists(fileBuf)) {
-                                g_ActiveFieldTexIndices.push_back(i);
-                            }
-                            swprintf_s(fileBuf, L"%s\\%s_%02d_00.dds", modFieldDir.c_str(), g_ActiveFieldName.c_str(), i);
-                            if (FileExists(fileBuf)) {
-                                g_ActiveFieldTexIndices.push_back(i);
-                            }
-                        }
-                    }
-                    // Sort and remove duplicates
-                    std::sort(g_ActiveFieldTexIndices.begin(), g_ActiveFieldTexIndices.end());
-                    g_ActiveFieldTexIndices.erase(std::unique(g_ActiveFieldTexIndices.begin(), g_ActiveFieldTexIndices.end()), g_ActiveFieldTexIndices.end());
-                    Log("[Loader] Active field map set to: %S - Found %d override textures\n", g_ActiveFieldName.c_str(), (int)g_ActiveFieldTexIndices.size());
                 }
             }
         } else {
