@@ -83,11 +83,11 @@ thread_local std::wstring g_LastLoadedTexFile = L"";
 thread_local bool t_InHookCreateTexture2D = false;
 std::wstring g_ActiveStageName = L"";
 int g_StageTextureCounter = 0;
-int g_MaxStageTextures = 0;
+std::vector<int> g_ActiveStageTexIndices;
 std::wstring g_CurrentStageTexName = L"";
 std::wstring g_ActiveFieldName = L"";
 int g_FieldTextureCounter = 0;
-int g_MaxFieldTextures = 0;
+std::vector<int> g_ActiveFieldTexIndices;
 std::wstring g_CurrentFieldTexName = L"";
 bool g_EnableTextureLogging = false;
 bool g_DisableD3D11Hooks = false;
@@ -733,10 +733,11 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 assetName = g_LastLoadedTexFile;
                 g_LastLoadedTexFile = L""; // Clear character texture tracking!
             }
-        } else if (!g_ActiveStageName.empty() && g_MaxStageTextures > 0) {
-            if (pDesc->Usage == 2 && pDesc->BindFlags == 8 && g_StageTextureCounter < g_MaxStageTextures) {
+        } else if (!g_ActiveStageName.empty() && !g_ActiveStageTexIndices.empty()) {
+            if (pDesc->Usage == 2 && pDesc->BindFlags == 8 && g_StageTextureCounter < g_ActiveStageTexIndices.size()) {
+                int actualIndex = g_ActiveStageTexIndices[g_StageTextureCounter];
                 wchar_t stageTexName[64];
-                swprintf_s(stageTexName, L"%s_T%02d_00", g_ActiveStageName.c_str(), g_StageTextureCounter);
+                swprintf_s(stageTexName, L"%s_T%02d_00", g_ActiveStageName.c_str(), actualIndex);
                 g_CurrentStageTexName = stageTexName;
                 g_StageTextureCounter++;
                 assetName = g_CurrentStageTexName;
@@ -744,10 +745,11 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 assetName = g_CurrentStageTexName;
                 g_CurrentStageTexName = L""; // Consume and clear immediately to prevent matching subsequent static textures!
             }
-        } else if (!g_ActiveFieldName.empty() && g_MaxFieldTextures > 0) {
-            if (pDesc->Usage == 2 && pDesc->BindFlags == 8 && g_FieldTextureCounter < g_MaxFieldTextures) {
+        } else if (!g_ActiveFieldName.empty() && !g_ActiveFieldTexIndices.empty()) {
+            if (pDesc->Usage == 2 && pDesc->BindFlags == 8 && g_FieldTextureCounter < g_ActiveFieldTexIndices.size()) {
+                int actualIndex = g_ActiveFieldTexIndices[g_FieldTextureCounter];
                 wchar_t fieldTexName[128];
-                swprintf_s(fieldTexName, L"%s_%02d_00", g_ActiveFieldName.c_str(), g_FieldTextureCounter);
+                swprintf_s(fieldTexName, L"%s_%02d_00", g_ActiveFieldName.c_str(), actualIndex);
                 g_CurrentFieldTexName = fieldTexName;
                 g_FieldTextureCounter++;
                 assetName = g_CurrentFieldTexName;
@@ -2292,29 +2294,28 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
                             g_ActiveFieldName = L"";
                             g_FieldTextureCounter = 0;
                             g_CurrentFieldTexName = L"";
-                            g_MaxFieldTextures = 0;
+                            g_ActiveFieldTexIndices.clear();
                             
-                            // Calculate max stage textures in active mods
-                            g_MaxStageTextures = 0;
+                            // Find all texture indices for this stage in active mods
+                            g_ActiveStageTexIndices.clear();
                             for (const auto& mod : g_ActiveMods) {
                                 std::wstring modBattleDir = g_ModsDirectory + L"\\" + mod + L"\\battle";
                                 for (int i = 0; i < 99; i++) {
                                     wchar_t fileBuf[MAX_PATH];
                                     swprintf_s(fileBuf, L"%s\\%s_T%02d_00.dds", modBattleDir.c_str(), g_ActiveStageName.c_str(), i);
                                     if (FileExists(fileBuf)) {
-                                        if (i + 1 > g_MaxStageTextures) {
-                                            g_MaxStageTextures = i + 1;
-                                        }
+                                        g_ActiveStageTexIndices.push_back(i);
                                     }
                                     swprintf_s(fileBuf, L"%s\\%s_T%02d_00.png", modBattleDir.c_str(), g_ActiveStageName.c_str(), i);
                                     if (FileExists(fileBuf)) {
-                                        if (i + 1 > g_MaxStageTextures) {
-                                            g_MaxStageTextures = i + 1;
-                                        }
+                                        g_ActiveStageTexIndices.push_back(i);
                                     }
                                 }
                             }
-                            Log("[Loader] Active battle stage set to: %S (due to entry %s, isMaster=%d) - Max override textures: %d\n", g_ActiveStageName.c_str(), entry.name.c_str(), isMasterFile, g_MaxStageTextures);
+                            // Sort and remove duplicates
+                            std::sort(g_ActiveStageTexIndices.begin(), g_ActiveStageTexIndices.end());
+                            g_ActiveStageTexIndices.erase(std::unique(g_ActiveStageTexIndices.begin(), g_ActiveStageTexIndices.end()), g_ActiveStageTexIndices.end());
+                            Log("[Loader] Active battle stage set to: %S (due to entry %s, isMaster=%d) - Found %d override textures\n", g_ActiveStageName.c_str(), entry.name.c_str(), isMasterFile, (int)g_ActiveStageTexIndices.size());
                         }
                     }
                 }
@@ -2326,28 +2327,27 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
                     g_ActiveFieldName = fieldName;
                     g_FieldTextureCounter = 0;
                     g_CurrentFieldTexName = L"";
-                    g_MaxFieldTextures = 0;
-
-                    // Calculate max field textures in active mods for this map
+                    
+                    // Find all texture indices for this field in active mods
+                    g_ActiveFieldTexIndices.clear();
                     for (const auto& mod : g_ActiveMods) {
                         std::wstring modFieldDir = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + mod + L"\\field\\" + g_ActiveFieldName;
                         for (int i = 0; i < 99; i++) {
                             wchar_t fileBuf[MAX_PATH];
                             swprintf_s(fileBuf, L"%s\\%s_%02d_00.png", modFieldDir.c_str(), g_ActiveFieldName.c_str(), i);
                             if (FileExists(fileBuf)) {
-                                if (i + 1 > g_MaxFieldTextures) {
-                                    g_MaxFieldTextures = i + 1;
-                                }
+                                g_ActiveFieldTexIndices.push_back(i);
                             }
                             swprintf_s(fileBuf, L"%s\\%s_%02d_00.dds", modFieldDir.c_str(), g_ActiveFieldName.c_str(), i);
                             if (FileExists(fileBuf)) {
-                                if (i + 1 > g_MaxFieldTextures) {
-                                    g_MaxFieldTextures = i + 1;
-                                }
+                                g_ActiveFieldTexIndices.push_back(i);
                             }
                         }
                     }
-                    Log("[Loader] Active field map set to: %S - Max override textures: %d\n", g_ActiveFieldName.c_str(), g_MaxFieldTextures);
+                    // Sort and remove duplicates
+                    std::sort(g_ActiveFieldTexIndices.begin(), g_ActiveFieldTexIndices.end());
+                    g_ActiveFieldTexIndices.erase(std::unique(g_ActiveFieldTexIndices.begin(), g_ActiveFieldTexIndices.end()), g_ActiveFieldTexIndices.end());
+                    Log("[Loader] Active field map set to: %S - Found %d override textures\n", g_ActiveFieldName.c_str(), (int)g_ActiveFieldTexIndices.size());
                 }
             }
         } else {
