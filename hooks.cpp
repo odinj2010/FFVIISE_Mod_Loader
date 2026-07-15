@@ -2320,33 +2320,35 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
                 }
             }
         } else if (archivePathLower.find(L"flevel.lgp") != std::wstring::npos) {
-            std::wstring fieldName = entryNameLower;
-            if (fieldName != g_ActiveFieldName) {
-                g_ActiveFieldName = fieldName;
-                g_FieldTextureCounter = 0;
-                g_CurrentFieldTexName = L"";
-                g_MaxFieldTextures = 0;
+            if (entryNameLower.find(L".") == std::wstring::npos) {
+                std::wstring fieldName = entryNameLower;
+                if (fieldName != g_ActiveFieldName) {
+                    g_ActiveFieldName = fieldName;
+                    g_FieldTextureCounter = 0;
+                    g_CurrentFieldTexName = L"";
+                    g_MaxFieldTextures = 0;
 
-                // Calculate max field textures in active mods for this map
-                for (const auto& mod : g_ActiveMods) {
-                    std::wstring modFieldDir = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + mod + L"\\field\\" + g_ActiveFieldName;
-                    for (int i = 0; i < 99; i++) {
-                        wchar_t fileBuf[MAX_PATH];
-                        swprintf_s(fileBuf, L"%s\\%s_%02d_00.png", modFieldDir.c_str(), g_ActiveFieldName.c_str(), i);
-                        if (FileExists(fileBuf)) {
-                            if (i + 1 > g_MaxFieldTextures) {
-                                g_MaxFieldTextures = i + 1;
+                    // Calculate max field textures in active mods for this map
+                    for (const auto& mod : g_ActiveMods) {
+                        std::wstring modFieldDir = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + mod + L"\\field\\" + g_ActiveFieldName;
+                        for (int i = 0; i < 99; i++) {
+                            wchar_t fileBuf[MAX_PATH];
+                            swprintf_s(fileBuf, L"%s\\%s_%02d_00.png", modFieldDir.c_str(), g_ActiveFieldName.c_str(), i);
+                            if (FileExists(fileBuf)) {
+                                if (i + 1 > g_MaxFieldTextures) {
+                                    g_MaxFieldTextures = i + 1;
+                                }
                             }
-                        }
-                        swprintf_s(fileBuf, L"%s\\%s_%02d_00.dds", modFieldDir.c_str(), g_ActiveFieldName.c_str(), i);
-                        if (FileExists(fileBuf)) {
-                            if (i + 1 > g_MaxFieldTextures) {
-                                g_MaxFieldTextures = i + 1;
+                            swprintf_s(fileBuf, L"%s\\%s_%02d_00.dds", modFieldDir.c_str(), g_ActiveFieldName.c_str(), i);
+                            if (FileExists(fileBuf)) {
+                                if (i + 1 > g_MaxFieldTextures) {
+                                    g_MaxFieldTextures = i + 1;
+                                }
                             }
                         }
                     }
+                    Log("[Loader] Active field map set to: %S - Max override textures: %d\n", g_ActiveFieldName.c_str(), g_MaxFieldTextures);
                 }
-                Log("[Loader] Active field map set to: %S - Max override textures: %d\n", g_ActiveFieldName.c_str(), g_MaxFieldTextures);
             }
         } else {
             if (entryNameLower.find(L".tex") != std::wstring::npos) {
