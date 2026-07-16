@@ -884,11 +884,20 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                     Log("[Loader] ERROR: LoadOverrideTexture failed for path %S: 0x%08X\n", overridePath.c_str(), hrLoad);
                 }
             } else if (pDesc->Usage == 2) {
-                HRESULT hrTag = (*ppTexture2D)->SetPrivateData(GUID_BackgroundAssetName, (UINT)((assetName.length() + 1) * sizeof(wchar_t)), assetName.c_str());
-                if (SUCCEEDED(hrTag)) {
-                    Log("[Loader] Tagged dynamic texture with background asset name %S in CreateTexture2D: %p\n", assetName.c_str(), *ppTexture2D);
-                } else {
-                    Log("[Loader] ERROR: SetPrivateData failed for dynamic background tag %S: 0x%08X\n", assetName.c_str(), hrTag);
+                bool isBg = false;
+                if (!g_ActiveFieldName.empty() && assetName.find(g_ActiveFieldName) == 0) {
+                    isBg = true;
+                } else if (!g_ActiveStageName.empty() && assetName.find(g_ActiveStageName) == 0) {
+                    isBg = true;
+                }
+
+                if (isBg) {
+                    HRESULT hrTag = (*ppTexture2D)->SetPrivateData(GUID_BackgroundAssetName, (UINT)((assetName.length() + 1) * sizeof(wchar_t)), assetName.c_str());
+                    if (SUCCEEDED(hrTag)) {
+                        Log("[Loader] Tagged dynamic texture with background asset name %S in CreateTexture2D: %p\n", assetName.c_str(), *ppTexture2D);
+                    } else {
+                        Log("[Loader] ERROR: SetPrivateData failed for dynamic background tag %S: 0x%08X\n", assetName.c_str(), hrTag);
+                    }
                 }
             }
         }
