@@ -102,6 +102,25 @@ GetFileAttributesA_t OriginalGetFileAttributesA = nullptr;
 typedef BOOL (WINAPI* GetFileAttributesExW_t)(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation);
 GetFileAttributesExW_t OriginalGetFileAttributesExW = nullptr;
 
+// {E485FBA9-7EBE-4F16-B0B4-2E824F35C7A2}
+static const GUID GUID_BackgroundAssetName = 
+{ 0xe485fba9, 0x7ebe, 0x4f16, { 0xb0, 0xb4, 0x2e, 0x82, 0x4f, 0x35, 0xc7, 0xa2 } };
+
+typedef HRESULT (STDMETHODCALLTYPE *CreateShaderResourceView_t)(
+    ID3D11Device* This,
+    ID3D11Resource* pResource,
+    const D3D11_SHADER_RESOURCE_VIEW_DESC* pDesc,
+    ID3D11ShaderResourceView** ppSRV
+);
+CreateShaderResourceView_t OriginalCreateShaderResourceView = nullptr;
+
+HRESULT STDMETHODCALLTYPE HookedCreateShaderResourceView(
+    ID3D11Device* This,
+    ID3D11Resource* pResource,
+    const D3D11_SHADER_RESOURCE_VIEW_DESC* pDesc,
+    ID3D11ShaderResourceView** ppSRV
+);
+
 void* HookVMT(void* pInstance, int index, void* pHookFunc) {
     if (!pInstance) return nullptr;
     void** pVMT = *(void***)pInstance;
@@ -726,24 +745,6 @@ std::wstring ResolveTextureOverride(const std::wstring& assetName) {
         baseName = baseName.substr(0, dotPos);
     }
 
-    if (!g_ActiveFieldName.empty() && baseName.find(g_ActiveFieldName) == 0) {
-        for (const auto& modFolder : g_ActiveMods) {
-            // Check under /layout_pc/flevel/<fieldname>/
-            std::wstring layoutPngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\layout_pc\\flevel\\" + g_ActiveFieldName + L"\\" + baseName + L".png";
-            if (FileExists(layoutPngPath)) return layoutPngPath;
-
-            std::wstring layoutDdsPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\layout_pc\\flevel\\" + g_ActiveFieldName + L"\\" + baseName + L".dds";
-            if (FileExists(layoutDdsPath)) return layoutDdsPath;
-
-            // Check under /field/<fieldname>/
-            std::wstring fieldPngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\field\\" + g_ActiveFieldName + L"\\" + baseName + L".png";
-            if (FileExists(fieldPngPath)) return fieldPngPath;
-
-            std::wstring fieldDdsPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\field\\" + g_ActiveFieldName + L"\\" + baseName + L".dds";
-            if (FileExists(fieldDdsPath)) return fieldDdsPath;
-        }
-    }
-
     for (const auto& modFolder : g_ActiveMods) {
         // 1. Check under /textures/
         std::wstring pngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\textures\\" + baseName + L".png";
@@ -751,6 +752,19 @@ std::wstring ResolveTextureOverride(const std::wstring& assetName) {
 
         std::wstring ddsPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\textures\\" + baseName + L".dds";
         if (FileExists(ddsPath)) return ddsPath;
+
+        // 1b. Check under /layout_pc/flevel/ field folders
+        if (!g_ActiveFieldName.empty()) {
+            std::wstring layoutPng = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\layout_pc\\flevel\\" + g_ActiveFieldName + L"\\" + baseName + L".png";
+            if (FileExists(layoutPng)) return layoutPng;
+            std::wstring layoutDds = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\layout_pc\\flevel\\" + g_ActiveFieldName + L"\\" + baseName + L".dds";
+            if (FileExists(layoutDds)) return layoutDds;
+
+            std::wstring fieldPng = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\field\\" + g_ActiveFieldName + L"\\" + baseName + L".png";
+            if (FileExists(fieldPng)) return fieldPng;
+            std::wstring fieldDds = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\field\\" + g_ActiveFieldName + L"\\" + baseName + L".dds";
+            if (FileExists(fieldDds)) return fieldDds;
+        }
 
         // 2. Check under /battle/ (specifically for battle stages/assets)
         std::wstring battlePngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\battle\\" + baseName + L".png";
@@ -774,18 +788,6 @@ HRESULT LoadOverrideTexture(ID3D11Device* pDevice, const std::wstring& filePath,
     return E_FAIL;
 }
 
-// {E485FBA9-7EBE-4F16-B0B4-2E824F35C7A2}
-static const GUID GUID_BackgroundAssetName = 
-{ 0xe485fba9, 0x7ebe, 0x4f16, { 0xb0, 0xb4, 0x2e, 0x82, 0x4f, 0x35, 0xc7, 0xa2 } };
-
-typedef HRESULT (STDMETHODCALLTYPE *CreateShaderResourceView_t)(
-    ID3D11Device* This,
-    ID3D11Resource* pResource,
-    const D3D11_SHADER_RESOURCE_VIEW_DESC* pDesc,
-    ID3D11ShaderResourceView** ppSRV
-);
-CreateShaderResourceView_t OriginalCreateShaderResourceView = nullptr;
-
 HRESULT STDMETHODCALLTYPE HookedCreateShaderResourceView(
     ID3D11Device* This,
     ID3D11Resource* pResource,
@@ -795,14 +797,17 @@ HRESULT STDMETHODCALLTYPE HookedCreateShaderResourceView(
     if (pResource && ppSRV) {
         wchar_t assetNameBuf[128] = { 0 };
         UINT dataSize = sizeof(assetNameBuf) - sizeof(wchar_t);
-        if (SUCCEEDED(pResource->GetPrivateData(GUID_BackgroundAssetName, &dataSize, assetNameBuf)) && assetNameBuf[0] != L'\0') {
+        HRESULT hrTag = pResource->GetPrivateData(GUID_BackgroundAssetName, &dataSize, assetNameBuf);
+        if (SUCCEEDED(hrTag) && assetNameBuf[0] != L'\0') {
             std::wstring assetName = assetNameBuf;
+            Log("[Loader] HookedCreateShaderResourceView: Found tagged resource %S\n", assetName.c_str());
             std::wstring overridePath = ResolveTextureOverride(assetName);
             if (!overridePath.empty()) {
+                Log("[Loader] Resolving override for %S -> %S\n", assetName.c_str(), overridePath.c_str());
                 ID3D11Texture2D* pOverrideTex = nullptr;
                 HRESULT hrLoad = LoadOverrideTexture(This, overridePath, D3D11_BIND_SHADER_RESOURCE, &pOverrideTex);
                 if (SUCCEEDED(hrLoad) && pOverrideTex) {
-                    HRESULT hrSRV = This->CreateShaderResourceView(pOverrideTex, nullptr, ppSRV);
+                    HRESULT hrSRV = This->CreateShaderResourceView(pOverrideTex, pDesc, ppSRV);
                     pOverrideTex->Release();
                     if (SUCCEEDED(hrSRV)) {
                         Log("[Loader] Swapped ShaderResourceView for background %S to high-res override SRV %p\n", assetName.c_str(), *ppSRV);
@@ -813,6 +818,8 @@ HRESULT STDMETHODCALLTYPE HookedCreateShaderResourceView(
                 } else {
                     Log("[Loader] ERROR: LoadOverrideTexture failed for background SRV override %S: 0x%08X\n", assetName.c_str(), hrLoad);
                 }
+            } else {
+                Log("[Loader] No override found for background asset %S\n", assetName.c_str());
             }
         }
     }
@@ -839,11 +846,6 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 assetName = g_LastLoadedTexFile;
                 g_LastLoadedTexFile = L""; // Clear character texture tracking!
             }
-        } else if (!g_ActiveFieldName.empty() && g_FieldTextureCounter < 4 && pDesc->Usage == 2 && pDesc->BindFlags == 8 && pDesc->Width == 256 && pDesc->Height == 256) {
-            wchar_t fieldTexName[64];
-            swprintf_s(fieldTexName, L"%s_%02d_00", g_ActiveFieldName.c_str(), g_FieldTextureCounter);
-            assetName = fieldTexName;
-            g_FieldTextureCounter++;
         } else if (!g_ActiveStageName.empty() && g_MaxStageTextures > 0) {
             if (pDesc->Usage == 2 && pDesc->BindFlags == 8 && g_StageTextureCounter < g_MaxStageTextures) {
                 wchar_t stageTexName[64];
@@ -855,6 +857,11 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 assetName = g_CurrentStageTexName;
                 g_CurrentStageTexName = L""; // Consume and clear immediately to prevent matching subsequent static textures!
             }
+        } else if (!g_ActiveFieldName.empty() && g_FieldTextureCounter < 4 && pDesc->Usage == 2 && pDesc->BindFlags == 8 && pDesc->Width == 256 && pDesc->Height == 256) {
+            wchar_t fieldTexName[64];
+            swprintf_s(fieldTexName, L"%s_%02d_00", g_ActiveFieldName.c_str(), g_FieldTextureCounter);
+            assetName = fieldTexName;
+            g_FieldTextureCounter++;
         }
 
         if (!assetName.empty()) {
@@ -883,21 +890,21 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 } else {
                     Log("[Loader] ERROR: LoadOverrideTexture failed for path %S: 0x%08X\n", overridePath.c_str(), hrLoad);
                 }
-            } else if (pDesc->Usage == 2) {
-                bool isBg = false;
-                if (!g_ActiveFieldName.empty() && assetName.find(g_ActiveFieldName) == 0) {
-                    isBg = true;
-                } else if (!g_ActiveStageName.empty() && assetName.find(g_ActiveStageName) == 0) {
-                    isBg = true;
-                }
-
-                if (isBg) {
-                    HRESULT hrTag = (*ppTexture2D)->SetPrivateData(GUID_BackgroundAssetName, (UINT)((assetName.length() + 1) * sizeof(wchar_t)), assetName.c_str());
-                    if (SUCCEEDED(hrTag)) {
-                        Log("[Loader] Tagged dynamic texture with background asset name %S in CreateTexture2D: %p\n", assetName.c_str(), *ppTexture2D);
-                    } else {
-                        Log("[Loader] ERROR: SetPrivateData failed for dynamic background tag %S: 0x%08X\n", assetName.c_str(), hrTag);
-                    }
+            }
+        }
+        
+        // Tag dynamic background quadrants
+        if (pDesc->Usage == 2) {
+            bool isBg = false;
+            if (!g_ActiveFieldName.empty() && assetName.find(g_ActiveFieldName) == 0) {
+                isBg = true;
+            }
+            if (isBg) {
+                HRESULT hrTag = (*ppTexture2D)->SetPrivateData(GUID_BackgroundAssetName, (UINT)((assetName.length() + 1) * sizeof(wchar_t)), assetName.c_str());
+                if (SUCCEEDED(hrTag)) {
+                    Log("[Loader] Tagged dynamic background texture %S in CreateTexture2D: %p\n", assetName.c_str(), *ppTexture2D);
+                } else {
+                    Log("[Loader] ERROR: SetPrivateData failed for dynamic background tag %S: 0x%08X\n", assetName.c_str(), hrTag);
                 }
             }
         }
@@ -2406,22 +2413,59 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
 
 
 
+void TrackActiveFieldFromName(const std::wstring& path) {
+    if (path.empty()) return;
+    std::wstring pathLower = path;
+    std::transform(pathLower.begin(), pathLower.end(), pathLower.begin(), ::towlower);
+    std::replace(pathLower.begin(), pathLower.end(), L'/', L'\\');
+    
+    size_t flevelPos = pathLower.find(L"layout_pc\\flevel\\");
+    size_t fieldPos = pathLower.find(L"field\\");
+    size_t startPos = std::wstring::npos;
+    size_t prefixLen = 0;
+    
+    if (flevelPos != std::wstring::npos) {
+        startPos = flevelPos;
+        prefixLen = 17; // length of "layout_pc\\flevel\\"
+    } else if (fieldPos != std::wstring::npos) {
+        startPos = fieldPos;
+        prefixLen = 6; // length of "field\\"
+    }
+    
+    if (startPos != std::wstring::npos) {
+        std::wstring sub = pathLower.substr(startPos + prefixLen);
+        size_t slashPos = sub.find(L'\\');
+        size_t dotPos = sub.find(L'.');
+        size_t endPos = std::wstring::npos;
+        if (slashPos != std::wstring::npos && dotPos != std::wstring::npos) {
+            endPos = min(slashPos, dotPos);
+        } else if (slashPos != std::wstring::npos) {
+            endPos = slashPos;
+        } else if (dotPos != std::wstring::npos) {
+            endPos = dotPos;
+        }
+        
+        std::wstring fieldName = (endPos != std::wstring::npos) ? sub.substr(0, endPos) : sub;
+        if (!fieldName.empty() && fieldName != L"char" && fieldName != L"flevel" && fieldName.find(L".tex") == std::wstring::npos) {
+            if (fieldName != g_ActiveFieldName) {
+                g_ActiveFieldName = fieldName;
+                g_ActiveStageName = L""; // Clear active battle stage!
+                g_FieldTextureCounter = 0;
+                Log("[Loader] Active field map set from loose path to: %S\n", g_ActiveFieldName.c_str());
+            }
+        }
+    }
+}
+
 DWORD WINAPI HookedGetFileAttributesW(LPCWSTR lpFileName) {
     if (lpFileName) {
+        TrackActiveFieldFromName(lpFileName);
         std::wstring absPath = GetFullPathSafe(lpFileName);
         if (!absPath.empty()) {
             std::wstring pathStr = absPath;
             std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
             std::wstring originalPath = pathStr;
             std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
-
-            if (pathStr.find(L"layout_pc") != std::wstring::npos ||
-                pathStr.find(L"flevel") != std::wstring::npos ||
-                pathStr.find(L"field") != std::wstring::npos ||
-                pathStr.find(L".png") != std::wstring::npos ||
-                pathStr.find(L".dds") != std::wstring::npos) {
-                Log("[Loader] GetFileAttributesW called for assets: %S\n", lpFileName);
-            }
 
             size_t dataPos = pathStr.find(L"\\data\\");
             if (dataPos != std::wstring::npos) {
@@ -2464,6 +2508,7 @@ DWORD WINAPI HookedGetFileAttributesW(LPCWSTR lpFileName) {
 DWORD WINAPI HookedGetFileAttributesA(LPCSTR lpFileName) {
     if (lpFileName) {
         std::wstring wFilename = AnsiToWide(lpFileName);
+        TrackActiveFieldFromName(wFilename);
         std::wstring absPath = GetFullPathSafe(wFilename);
         if (!absPath.empty()) {
             std::wstring pathStr = absPath;
@@ -2512,6 +2557,7 @@ DWORD WINAPI HookedGetFileAttributesA(LPCSTR lpFileName) {
 
 BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation) {
     if (lpFileName) {
+        TrackActiveFieldFromName(lpFileName);
         std::wstring absPath = GetFullPathSafe(lpFileName);
         if (!absPath.empty()) {
             std::wstring pathStr = absPath;
@@ -2567,20 +2613,13 @@ HANDLE WINAPI HookedCreateFileW(
     HANDLE hTemplateFile
 ) {
     if (lpFileName) {
+        TrackActiveFieldFromName(lpFileName);
         std::wstring absPath = GetFullPathSafe(lpFileName);
         if (!absPath.empty()) {
             std::wstring pathStr = absPath;
             std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
             std::wstring originalPath = pathStr;
             std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
-
-            if (pathStr.find(L"layout_pc") != std::wstring::npos ||
-                pathStr.find(L"flevel") != std::wstring::npos ||
-                pathStr.find(L"field") != std::wstring::npos ||
-                pathStr.find(L".png") != std::wstring::npos ||
-                pathStr.find(L".dds") != std::wstring::npos) {
-                Log("[Loader] CreateFileW called for assets: %S\n", lpFileName);
-            }
 
             size_t dataPos = pathStr.find(L"\\data\\");
             if (dataPos != std::wstring::npos) {
@@ -2647,6 +2686,7 @@ HANDLE WINAPI HookedCreateFileA(
 ) {
     if (lpFileName) {
         std::wstring wFilename = AnsiToWide(lpFileName);
+        TrackActiveFieldFromName(wFilename);
         std::wstring absPath = GetFullPathSafe(wFilename);
         if (!absPath.empty()) {
             std::wstring pathStr = absPath;
@@ -2816,14 +2856,16 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
             }
         } else {
             if (archivePathLower.find(L"flevel.lgp") != std::wstring::npos) {
-                size_t dotPos = entryNameLower.find(L".");
-                if (dotPos != std::wstring::npos) {
-                    std::wstring fieldName = entryNameLower.substr(0, dotPos);
-                    if (fieldName != g_ActiveFieldName) {
-                        g_ActiveFieldName = fieldName;
-                        g_ActiveStageName = L""; // Clear active battle stage!
-                        g_FieldTextureCounter = 0;
-                        Log("[Loader] Active field map set to: %S\n", g_ActiveFieldName.c_str());
+                if (entryNameLower.find(L".tex") == std::wstring::npos) { // Only map files, not character textures
+                    size_t dotPos = entryNameLower.find(L".");
+                    std::wstring fieldName = (dotPos != std::wstring::npos) ? entryNameLower.substr(0, dotPos) : entryNameLower;
+                    if (!fieldName.empty() && fieldName != L"flevel") {
+                        if (fieldName != g_ActiveFieldName) {
+                            g_ActiveFieldName = fieldName;
+                            g_ActiveStageName = L""; // Clear active battle stage!
+                            g_FieldTextureCounter = 0;
+                            Log("[Loader] Active field map set to: %S\n", g_ActiveFieldName.c_str());
+                        }
                     }
                 }
             }
