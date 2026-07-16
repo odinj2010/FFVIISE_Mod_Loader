@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <string>
 #include <unordered_map>
+#include <map>
 #include <vector>
 #include <mutex>
 #include <algorithm>
@@ -134,6 +135,34 @@ void* HookVMT(void* pInstance, int index, void* pHookFunc) {
     return pOriginal;
 }
 
+void HookContextMethod(void* pInstance, int index, void* pHookFunc, void** ppOriginal) {
+    if (!pInstance || !ppOriginal || *ppOriginal != nullptr) return;
+    void** pVMT = *(void***)pInstance;
+    if (!pVMT) return;
+    void* pTarget = pVMT[index];
+    MH_STATUS status = MH_CreateHook(pTarget, pHookFunc, ppOriginal);
+    if (status == MH_OK) {
+        MH_EnableHook(pTarget);
+        Log("[Loader] Detoured context method %d successfully! Target=%p, Original=%p\n", index, pTarget, *ppOriginal);
+    } else {
+        Log("[Loader] ERROR: Failed to detour context method %d: %d\n", index, status);
+    }
+}
+
+void HookDeviceMethod(void* pInstance, int index, void* pHookFunc, void** ppOriginal) {
+    if (!pInstance || !ppOriginal || *ppOriginal != nullptr) return;
+    void** pVMT = *(void***)pInstance;
+    if (!pVMT) return;
+    void* pTarget = pVMT[index];
+    MH_STATUS status = MH_CreateHook(pTarget, pHookFunc, ppOriginal);
+    if (status == MH_OK) {
+        MH_EnableHook(pTarget);
+        Log("[Loader] Detoured device method %d successfully! Target=%p, Original=%p\n", index, pTarget, *ppOriginal);
+    } else {
+        Log("[Loader] ERROR: Failed to detour device method %d: %d\n", index, status);
+    }
+}
+
 HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
     IDXGIAdapter* pAdapter,
     D3D_DRIVER_TYPE DriverType,
@@ -160,6 +189,16 @@ int g_MaxStageTextures = 0;
 std::wstring g_CurrentStageTexName = L"";
 std::wstring g_ActiveFieldName = L"";
 int g_FieldTextureCounter = 0;
+bool g_FieldMapLoaded = false;
+ULONGLONG g_MapLoadStartTime = 0;
+ULONGLONG g_LastMapFileReadTime = 0;
+std::wstring g_CachedFieldName = L"";
+int g_CanvasCount = 0;
+std::unordered_map<int, ID3D11Texture2D*> g_CachedStitchedCanvases;
+std::map<ID3D11Resource*, int> g_CanvasResourceSheets;
+std::map<int, ID3D11ShaderResourceView*> g_StitchedCanvasSRVs;
+std::map<ID3D11Resource*, std::wstring> g_ResourceAssetNames;
+int g_ActiveSheetIndex = 0;
 bool g_EnableTextureLogging = false;
 bool g_DisableD3D11Hooks = false;
 // Direct3D 11 Context hook declarations removed
@@ -406,6 +445,7 @@ DWORD WINAPI OverlayThread(LPVOID lpParam) {
 }
 
 HRESULT WINAPI HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
+    g_FieldMapLoaded = true; // Mark map as loaded after first frame renders!
     if (g_OverlayEnabled) {
         if (g_StartTickCount == 0) {
             g_StartTickCount = GetTickCount64();
@@ -776,6 +816,38 @@ std::wstring ResolveTextureOverride(const std::wstring& assetName) {
     return L"";
 }
 
+void ClearCachedStitchedCanvases() {
+    for (auto& pair : g_StitchedCanvasSRVs) {
+        if (pair.second) {
+            pair.second->Release();
+        }
+    }
+    g_StitchedCanvasSRVs.clear();
+    g_CanvasResourceSheets.clear();
+    g_ResourceAssetNames.clear();
+    g_ActiveSheetIndex = 0;
+    g_CanvasCount = 0;
+    for (auto& pair : g_CachedStitchedCanvases) {
+        if (pair.second) {
+            pair.second->Release();
+        }
+    }
+    g_CachedStitchedCanvases.clear();
+}
+
+int ParseQuadrantIndex(const std::wstring& name) {
+    size_t firstUnderscore = name.find(L"_");
+    if (firstUnderscore != std::wstring::npos && firstUnderscore + 3 <= name.length()) {
+        std::wstring numStr = name.substr(firstUnderscore + 1, 2);
+        try {
+            return std::stoi(numStr);
+        } catch (...) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
 HRESULT LoadOverrideTexture(ID3D11Device* pDevice, const std::wstring& filePath, UINT bindFlags, ID3D11Texture2D** ppTexture) {
     std::wstring ext = filePath.substr(filePath.rfind(L'.'));
     std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
@@ -786,6 +858,632 @@ HRESULT LoadOverrideTexture(ID3D11Device* pDevice, const std::wstring& filePath,
         return LoadTextureFromDds(pDevice, filePath, bindFlags, ppTexture);
     }
     return E_FAIL;
+}
+
+HRESULT LoadPngPixels(const std::wstring& filePath, std::vector<BYTE>& outPixels, UINT& outWidth, UINT& outHeight) {
+    IWICImagingFactory* pWICFactory = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pWICFactory));
+    if (FAILED(hr)) {
+        CoInitialize(nullptr);
+        hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pWICFactory));
+        if (FAILED(hr)) return hr;
+    }
+
+    IWICBitmapDecoder* pDecoder = nullptr;
+    hr = pWICFactory->CreateDecoderFromFilename(filePath.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &pDecoder);
+    if (FAILED(hr)) {
+        pWICFactory->Release();
+        return hr;
+    }
+
+    IWICBitmapFrameDecode* pFrame = nullptr;
+    hr = pDecoder->GetFrame(0, &pFrame);
+    if (FAILED(hr)) {
+        pDecoder->Release();
+        pWICFactory->Release();
+        return hr;
+    }
+
+    pFrame->GetSize(&outWidth, &outHeight);
+
+    IWICFormatConverter* pConverter = nullptr;
+    hr = pWICFactory->CreateFormatConverter(&pConverter);
+    if (FAILED(hr)) {
+        pFrame->Release();
+        pDecoder->Release();
+        pWICFactory->Release();
+        return hr;
+    }
+
+    hr = pConverter->Initialize(pFrame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) {
+        pConverter->Release();
+        pFrame->Release();
+        pDecoder->Release();
+        pWICFactory->Release();
+        return hr;
+    }
+
+    UINT rowPitch = outWidth * 4;
+    UINT imageSize = rowPitch * outHeight;
+    outPixels.resize(imageSize);
+    hr = pConverter->CopyPixels(nullptr, rowPitch, imageSize, outPixels.data());
+
+    pConverter->Release();
+    pFrame->Release();
+    pDecoder->Release();
+    pWICFactory->Release();
+    return hr;
+}
+
+HRESULT LoadAndStitchBackgroundCanvas(ID3D11Device* pDevice, const std::wstring& fieldName, int canvasIndex, ID3D11Texture2D** ppTexture) {
+    if (fieldName == g_CachedFieldName) {
+        auto it = g_CachedStitchedCanvases.find(canvasIndex);
+        if (it != g_CachedStitchedCanvases.end() && it->second != nullptr) {
+            it->second->AddRef();
+            *ppTexture = it->second;
+            Log("[Loader] Stitched Canvas: Reusing cached stitched background canvas sheet %d for field %S\n", canvasIndex, fieldName.c_str());
+            return S_OK;
+        }
+    }
+
+    UINT sheetOffset = canvasIndex * 16;
+
+    // 1. Locate the first quadrant (_XX_00) to determine size
+    wchar_t firstQuadName[128];
+    swprintf_s(firstQuadName, L"%s_%02d_00", fieldName.c_str(), sheetOffset);
+    std::wstring firstPath = ResolveTextureOverride(firstQuadName);
+    if (firstPath.empty()) {
+        Log("[Loader] Stitched Canvas: Missing override path for first quadrant of sheet %d: %S\n", canvasIndex, firstQuadName);
+        return E_FAIL;
+    }
+    Log("[Loader] Stitched Canvas: Sheet %d resolved first quadrant %S -> %S\n", canvasIndex, firstQuadName, firstPath.c_str());
+
+    std::vector<BYTE> firstPixels;
+    UINT targetW = 0, targetH = 0;
+    HRESULT hr = LoadPngPixels(firstPath, firstPixels, targetW, targetH);
+    if (FAILED(hr)) {
+        Log("[Loader] Stitched Canvas: Failed to load first quadrant from %S: 0x%08X\n", firstPath.c_str(), hr);
+        return hr;
+    }
+
+    // 2. Set up the canvas dimensions (4x4 grid of quadrants)
+    UINT canvasW = targetW * 4;
+    UINT canvasH = targetH * 4;
+    UINT canvasRowPitch = canvasW * 4;
+    UINT canvasSize = canvasRowPitch * canvasH;
+    std::vector<BYTE> canvasPixels(canvasSize, 0); // Filled with transparent black
+
+    // Copy first quadrant into (col=0, row=0)
+    for (UINT y = 0; y < targetH; ++y) {
+        memcpy(&canvasPixels[(y * canvasW + 0) * 4], &firstPixels[y * targetW * 4], targetW * 4);
+    }
+
+    // 3. Scan and stitch all other quadrants in the 4x4 grid (col 0-3, row 0-3)
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            if (row == 0 && col == 0) continue; // Already loaded
+
+            int quadIndex = sheetOffset + (row * 4) + col;
+            wchar_t quadName[128];
+            swprintf_s(quadName, L"%s_%02d_00", fieldName.c_str(), quadIndex);
+            std::wstring quadPath = ResolveTextureOverride(quadName);
+            if (quadPath.empty()) continue; // Skip if it doesn't exist (leaves area transparent)
+            Log("[Loader] Stitched Canvas: Sheet %d resolved quadrant %S -> %S\n", canvasIndex, quadName, quadPath.c_str());
+
+            std::vector<BYTE> quadPixels;
+            UINT w = 0, h = 0;
+            if (SUCCEEDED(LoadPngPixels(quadPath, quadPixels, w, h))) {
+                if (w == targetW && h == targetH) {
+                    // Copy into canvas at (col, row)
+                    for (UINT y = 0; y < targetH; ++y) {
+                        UINT destX = col * targetW;
+                        UINT destY = row * targetH + y;
+                        memcpy(&canvasPixels[(destY * canvasW + destX) * 4], &quadPixels[y * targetW * 4], targetW * 4);
+                    }
+                } else {
+                    Log("[Loader] Stitched Canvas Warning: Size mismatch for %S (expected %ux%u, got %ux%u)\n", quadName, targetW, targetH, w, h);
+                }
+            }
+        }
+    }
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = canvasW;
+    desc.Height = canvasH;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = 0;
+
+    D3D11_SUBRESOURCE_DATA initData = {};
+    initData.pSysMem = canvasPixels.data();
+    initData.SysMemPitch = canvasRowPitch;
+    initData.SysMemSlicePitch = canvasSize;
+
+    hr = pDevice->CreateTexture2D(&desc, &initData, ppTexture);
+    if (SUCCEEDED(hr)) {
+        Log("[Loader] Stitched Canvas: Created stitched background canvas sheet %d (%ux%u) for field %S\n", canvasIndex, canvasW, canvasH, fieldName.c_str());
+        
+        // Store in cache
+        auto it = g_CachedStitchedCanvases.find(canvasIndex);
+        if (it != g_CachedStitchedCanvases.end() && it->second != nullptr) {
+            it->second->Release();
+        }
+        g_CachedStitchedCanvases[canvasIndex] = *ppTexture;
+        (*ppTexture)->AddRef(); // Keep it alive for the cache
+        g_CachedFieldName = fieldName;
+    } else {
+        Log("[Loader] Stitched Canvas ERROR: CreateTexture2D failed: 0x%08X\n", hr);
+    }
+    return hr;
+}
+
+typedef void (STDMETHODCALLTYPE *CopySubresourceRegion_t)(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pDstResource,
+    UINT DstSubresource,
+    UINT DstX,
+    UINT DstY,
+    UINT DstZ,
+    ID3D11Resource* pSrcResource,
+    UINT SrcSubresource,
+    const D3D11_BOX* pSrcBox
+);
+CopySubresourceRegion_t OriginalCopySubresourceRegion = nullptr;
+
+typedef void (STDMETHODCALLTYPE *CopyResource_t)(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pDstResource,
+    ID3D11Resource* pSrcResource
+);
+CopyResource_t OriginalCopyResource = nullptr;
+
+typedef void (STDMETHODCALLTYPE *ResolveSubresource_t)(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pDstResource,
+    UINT DstSubresource,
+    ID3D11Resource* pSrcResource,
+    UINT SrcSubresource,
+    DXGI_FORMAT Format
+);
+ResolveSubresource_t OriginalResolveSubresource = nullptr;
+
+void STDMETHODCALLTYPE HookedCopySubresourceRegion(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pDstResource,
+    UINT DstSubresource,
+    UINT DstX,
+    UINT DstY,
+    UINT DstZ,
+    ID3D11Resource* pSrcResource,
+    UINT SrcSubresource,
+    const D3D11_BOX* pSrcBox
+) {
+    if (pSrcResource && pDstResource) {
+        auto it = g_CanvasResourceSheets.find(pSrcResource);
+        if (it != g_CanvasResourceSheets.end()) {
+            g_CanvasResourceSheets[pDstResource] = it->second;
+            Log("[Loader] CopySubresourceRegion: Propagated sheet %d from %p to %p\n", it->second, pSrcResource, pDstResource);
+        }
+        wchar_t assetNameBuf[128] = { 0 };
+        UINT dataSize = sizeof(assetNameBuf) - sizeof(wchar_t);
+        if (SUCCEEDED(pSrcResource->GetPrivateData(GUID_BackgroundAssetName, &dataSize, assetNameBuf)) && assetNameBuf[0] != L'\0') {
+            Log("[Loader] Intercepted CopySubresourceRegion: Src=%S, DstX=%u, DstY=%u\n", assetNameBuf, DstX, DstY);
+        }
+    }
+    OriginalCopySubresourceRegion(This, pDstResource, DstSubresource, DstX, DstY, DstZ, pSrcResource, SrcSubresource, pSrcBox);
+}
+
+void STDMETHODCALLTYPE HookedCopyResource(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pDstResource,
+    ID3D11Resource* pSrcResource
+) {
+    if (pSrcResource && pDstResource) {
+        auto it = g_CanvasResourceSheets.find(pSrcResource);
+        if (it != g_CanvasResourceSheets.end()) {
+            g_CanvasResourceSheets[pDstResource] = it->second;
+            Log("[Loader] CopyResource: Propagated sheet %d from %p to %p\n", it->second, pSrcResource, pDstResource);
+        }
+        wchar_t assetNameBuf[128] = { 0 };
+        UINT dataSize = sizeof(assetNameBuf) - sizeof(wchar_t);
+        if (SUCCEEDED(pSrcResource->GetPrivateData(GUID_BackgroundAssetName, &dataSize, assetNameBuf)) && assetNameBuf[0] != L'\0') {
+            Log("[Loader] Intercepted CopyResource: Src=%S\n", assetNameBuf);
+        }
+    }
+    OriginalCopyResource(This, pDstResource, pSrcResource);
+}
+
+void STDMETHODCALLTYPE HookedResolveSubresource(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pDstResource,
+    UINT DstSubresource,
+    ID3D11Resource* pSrcResource,
+    UINT SrcSubresource,
+    DXGI_FORMAT Format
+) {
+    if (pSrcResource && pDstResource) {
+        auto it = g_CanvasResourceSheets.find(pSrcResource);
+        if (it != g_CanvasResourceSheets.end()) {
+            g_CanvasResourceSheets[pDstResource] = it->second;
+            Log("[Loader] ResolveSubresource: Propagated sheet %d from %p to %p\n", it->second, pSrcResource, pDstResource);
+        }
+        wchar_t assetNameBuf[128] = { 0 };
+        UINT dataSize = sizeof(assetNameBuf) - sizeof(wchar_t);
+        if (SUCCEEDED(pSrcResource->GetPrivateData(GUID_BackgroundAssetName, &dataSize, assetNameBuf)) && assetNameBuf[0] != L'\0') {
+            Log("[Loader] Intercepted ResolveSubresource: Src=%S\n", assetNameBuf);
+        }
+    }
+    OriginalResolveSubresource(This, pDstResource, DstSubresource, pSrcResource, SrcSubresource, Format);
+}
+
+typedef void (STDMETHODCALLTYPE *DrawIndexed_t)(
+    ID3D11DeviceContext* This,
+    UINT IndexCount,
+    UINT StartIndexLocation,
+    INT BaseVertexLocation
+);
+DrawIndexed_t OriginalDrawIndexed = nullptr;
+
+typedef void (STDMETHODCALLTYPE *Draw_t)(
+    ID3D11DeviceContext* This,
+    UINT VertexCount,
+    UINT StartVertexLocation
+);
+Draw_t OriginalDraw = nullptr;
+
+typedef void (STDMETHODCALLTYPE *DrawIndexedInstanced_t)(
+    ID3D11DeviceContext* This,
+    UINT IndexCountPerInstance,
+    UINT InstanceCount,
+    UINT StartIndexLocation,
+    INT BaseVertexLocation,
+    UINT StartInstanceLocation
+);
+DrawIndexedInstanced_t OriginalDrawIndexedInstanced = nullptr;
+
+typedef void (STDMETHODCALLTYPE *DrawInstanced_t)(
+    ID3D11DeviceContext* This,
+    UINT VertexCountPerInstance,
+    UINT InstanceCount,
+    UINT StartVertexLocation,
+    UINT StartInstanceLocation
+);
+DrawInstanced_t OriginalDrawInstanced = nullptr;
+
+typedef void (STDMETHODCALLTYPE *OMSetRenderTargets_t)(
+    ID3D11DeviceContext* This,
+    UINT NumViews,
+    ID3D11RenderTargetView* const* ppRenderTargetViews,
+    ID3D11DepthStencilView* pDepthStencilView
+);
+OMSetRenderTargets_t OriginalOMSetRenderTargets = nullptr;
+
+typedef void (STDMETHODCALLTYPE *OMSetRenderTargetsAndUnorderedAccessViews_t)(
+    ID3D11DeviceContext* This,
+    UINT NumRTVs,
+    ID3D11RenderTargetView* const* ppRenderTargetViews,
+    ID3D11DepthStencilView* pDepthStencilView,
+    UINT UAVStartSlot,
+    UINT NumUAVs,
+    ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
+    const UINT* pUAVInitialCounts
+);
+OMSetRenderTargetsAndUnorderedAccessViews_t OriginalOMSetRenderTargetsAndUnorderedAccessViews = nullptr;
+
+void TrackCanvasAssociation(ID3D11DeviceContext* This, ID3D11Resource* pRes) {
+    if (g_CanvasResourceSheets.find(pRes) != g_CanvasResourceSheets.end()) {
+        return; // Already associated!
+    }
+
+    wchar_t canvasNameBuf[128] = { 0 };
+    UINT canvasNameSize = sizeof(canvasNameBuf) - sizeof(wchar_t);
+    pRes->GetPrivateData(GUID_BackgroundAssetName, &canvasNameSize, canvasNameBuf);
+    
+    Log("[Loader] TrackCanvasAssociation: Checking canvas %S (%p)\n", canvasNameBuf, pRes);
+
+    ID3D11ShaderResourceView* pQuadSRV = nullptr;
+    This->PSGetShaderResources(0, 1, &pQuadSRV);
+    if (!pQuadSRV) {
+        Log("[Loader]   Slot 0 is NULL\n");
+        return;
+    }
+
+    ID3D11Resource* pQuadRes = nullptr;
+    pQuadSRV->GetResource(&pQuadRes);
+    if (!pQuadRes) {
+        Log("[Loader]   Slot 0 resource is NULL\n");
+        pQuadSRV->Release();
+        return;
+    }
+
+    wchar_t quadTag[128] = { 0 };
+    UINT quadTagSize = sizeof(quadTag) - sizeof(wchar_t);
+    HRESULT hrTag = pQuadRes->GetPrivateData(GUID_BackgroundAssetName, &quadTagSize, quadTag);
+    if (FAILED(hrTag) || quadTag[0] == L'\0') {
+        auto itSrc = g_CanvasResourceSheets.find(pQuadRes);
+        if (itSrc != g_CanvasResourceSheets.end()) {
+            int sheetIndex = itSrc->second;
+            g_CanvasResourceSheets[pRes] = sheetIndex;
+            Log("[Loader] Associated canvas resource %p with sheet %d based on source canvas %p in Draw call\n", pRes, sheetIndex, pQuadRes);
+        } else {
+            Log("[Loader]   Slot 0 resource %p has NO tag (hr=0x%08X)\n", pQuadRes, hrTag);
+        }
+        pQuadRes->Release();
+        pQuadSRV->Release();
+        return;
+    }
+
+    std::wstring quadName = quadTag;
+    Log("[Loader]   Slot 0 resource %p has tag %S\n", pQuadRes, quadTag);
+
+    int quadIndex = ParseQuadrantIndex(quadName);
+    if (quadIndex < 0) {
+        Log("[Loader]   Failed to parse quadrant index from tag %S\n", quadTag);
+        pQuadRes->Release();
+        pQuadSRV->Release();
+        return;
+    }
+
+    int sheetIndex = quadIndex / 16;
+    g_CanvasResourceSheets[pRes] = sheetIndex;
+    g_ActiveSheetIndex = sheetIndex;
+    Log("[Loader] Associated canvas resource %p with sheet %d based on quadrant %S in Draw call\n", pRes, sheetIndex, quadTag);
+
+    // Lazy-create stitched canvas SRV if needed
+    if (g_StitchedCanvasSRVs.find(sheetIndex) == g_StitchedCanvasSRVs.end()) {
+        ID3D11Device* pDevice = nullptr;
+        This->GetDevice(&pDevice);
+        if (pDevice) {
+            ID3D11Texture2D* pStitchedTex = nullptr;
+            HRESULT hrStitch = LoadAndStitchBackgroundCanvas(pDevice, g_ActiveFieldName, sheetIndex, &pStitchedTex);
+            if (SUCCEEDED(hrStitch) && pStitchedTex) {
+                ID3D11ShaderResourceView* pStitchedSRV = nullptr;
+                HRESULT hrSRV = pDevice->CreateShaderResourceView(pStitchedTex, nullptr, &pStitchedSRV);
+                pStitchedTex->Release();
+                if (SUCCEEDED(hrSRV) && pStitchedSRV) {
+                    g_StitchedCanvasSRVs[sheetIndex] = pStitchedSRV;
+                    Log("[Loader] Created stitched canvas SRV %p for sheet %d\n", pStitchedSRV, sheetIndex);
+                } else {
+                    Log("[Loader]   Failed to create SRV for stitched canvas: 0x%08X\n", hrSRV);
+                }
+            } else {
+                Log("[Loader]   Failed to stitch canvas: 0x%08X\n", hrStitch);
+            }
+            pDevice->Release();
+        }
+    }
+
+    pQuadRes->Release();
+    pQuadSRV->Release();
+}
+
+void STDMETHODCALLTYPE HookedDrawIndexed(
+    ID3D11DeviceContext* This,
+    UINT IndexCount,
+    UINT StartIndexLocation,
+    INT BaseVertexLocation
+) {
+    ID3D11RenderTargetView* pRTV = nullptr;
+    This->OMGetRenderTargets(1, &pRTV, nullptr);
+    if (pRTV) {
+        ID3D11Resource* pRes = nullptr;
+        pRTV->GetResource(&pRes);
+        if (pRes) {
+            wchar_t assetNameBuf[128] = { 0 };
+            UINT dataSize = sizeof(assetNameBuf) - sizeof(wchar_t);
+            HRESULT hrTag = pRes->GetPrivateData(GUID_BackgroundAssetName, &dataSize, assetNameBuf);
+            if (SUCCEEDED(hrTag) && assetNameBuf[0] != L'\0') {
+                Log("[Loader] HookedDrawIndexed: RenderTarget=%S\n", assetNameBuf);
+                std::wstring assetName = assetNameBuf;
+                if (assetName.find(L"_canvas") != std::wstring::npos) {
+                    TrackCanvasAssociation(This, pRes);
+                }
+            }
+            pRes->Release();
+        }
+        pRTV->Release();
+    }
+    OriginalDrawIndexed(This, IndexCount, StartIndexLocation, BaseVertexLocation);
+}
+
+void STDMETHODCALLTYPE HookedDraw(
+    ID3D11DeviceContext* This,
+    UINT VertexCount,
+    UINT StartVertexLocation
+) {
+    ID3D11RenderTargetView* pRTV = nullptr;
+    This->OMGetRenderTargets(1, &pRTV, nullptr);
+    if (pRTV) {
+        ID3D11Resource* pRes = nullptr;
+        pRTV->GetResource(&pRes);
+        if (pRes) {
+            wchar_t assetNameBuf[128] = { 0 };
+            UINT dataSize = sizeof(assetNameBuf) - sizeof(wchar_t);
+            HRESULT hrTag = pRes->GetPrivateData(GUID_BackgroundAssetName, &dataSize, assetNameBuf);
+            if (SUCCEEDED(hrTag) && assetNameBuf[0] != L'\0') {
+                Log("[Loader] HookedDraw: RenderTarget=%S\n", assetNameBuf);
+                std::wstring assetName = assetNameBuf;
+                if (assetName.find(L"_canvas") != std::wstring::npos) {
+                    TrackCanvasAssociation(This, pRes);
+                }
+            }
+            pRes->Release();
+        }
+        pRTV->Release();
+    }
+    OriginalDraw(This, VertexCount, StartVertexLocation);
+}
+
+void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
+    ID3D11DeviceContext* This,
+    UINT IndexCountPerInstance,
+    UINT InstanceCount,
+    UINT StartIndexLocation,
+    INT BaseVertexLocation,
+    UINT StartInstanceLocation
+) {
+    ID3D11RenderTargetView* pRTV = nullptr;
+    This->OMGetRenderTargets(1, &pRTV, nullptr);
+    if (pRTV) {
+        ID3D11Resource* pRes = nullptr;
+        pRTV->GetResource(&pRes);
+        if (pRes) {
+            wchar_t assetNameBuf[128] = { 0 };
+            UINT dataSize = sizeof(assetNameBuf) - sizeof(wchar_t);
+            HRESULT hrTag = pRes->GetPrivateData(GUID_BackgroundAssetName, &dataSize, assetNameBuf);
+            if (SUCCEEDED(hrTag) && assetNameBuf[0] != L'\0') {
+                Log("[Loader] HookedDrawIndexedInstanced: RenderTarget=%S\n", assetNameBuf);
+                std::wstring assetName = assetNameBuf;
+                if (assetName.find(L"_canvas") != std::wstring::npos) {
+                    TrackCanvasAssociation(This, pRes);
+                }
+            }
+            pRes->Release();
+        }
+        pRTV->Release();
+    }
+    OriginalDrawIndexedInstanced(This, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+}
+
+void STDMETHODCALLTYPE HookedDrawInstanced(
+    ID3D11DeviceContext* This,
+    UINT VertexCountPerInstance,
+    UINT InstanceCount,
+    UINT StartVertexLocation,
+    UINT StartInstanceLocation
+) {
+    ID3D11RenderTargetView* pRTV = nullptr;
+    This->OMGetRenderTargets(1, &pRTV, nullptr);
+    if (pRTV) {
+        ID3D11Resource* pRes = nullptr;
+        pRTV->GetResource(&pRes);
+        if (pRes) {
+            wchar_t assetNameBuf[128] = { 0 };
+            UINT dataSize = sizeof(assetNameBuf) - sizeof(wchar_t);
+            HRESULT hrTag = pRes->GetPrivateData(GUID_BackgroundAssetName, &dataSize, assetNameBuf);
+            if (SUCCEEDED(hrTag) && assetNameBuf[0] != L'\0') {
+                Log("[Loader] HookedDrawInstanced: RenderTarget=%S\n", assetNameBuf);
+                std::wstring assetName = assetNameBuf;
+                if (assetName.find(L"_canvas") != std::wstring::npos) {
+                    TrackCanvasAssociation(This, pRes);
+                }
+            }
+            pRes->Release();
+        }
+        pRTV->Release();
+    }
+    OriginalDrawInstanced(This, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+}
+
+void STDMETHODCALLTYPE HookedOMSetRenderTargets(
+    ID3D11DeviceContext* This,
+    UINT NumViews,
+    ID3D11RenderTargetView* const* ppRenderTargetViews,
+    ID3D11DepthStencilView* pDepthStencilView
+) {
+    OriginalOMSetRenderTargets(This, NumViews, ppRenderTargetViews, pDepthStencilView);
+}
+
+void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUnorderedAccessViews(
+    ID3D11DeviceContext* This,
+    UINT NumRTVs,
+    ID3D11RenderTargetView* const* ppRenderTargetViews,
+    ID3D11DepthStencilView* pDepthStencilView,
+    UINT UAVStartSlot,
+    UINT NumUAVs,
+    ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
+    const UINT* pUAVInitialCounts
+) {
+    OriginalOMSetRenderTargetsAndUnorderedAccessViews(This, NumRTVs, ppRenderTargetViews, pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews, pUAVInitialCounts);
+}
+
+typedef void (STDMETHODCALLTYPE *PSSetShaderResources_t)(
+    ID3D11DeviceContext* This,
+    UINT StartSlot,
+    UINT NumViews,
+    ID3D11ShaderResourceView* const* ppShaderResourceViews
+);
+PSSetShaderResources_t OriginalPSSetShaderResources = nullptr;
+
+void STDMETHODCALLTYPE HookedPSSetShaderResources(
+    ID3D11DeviceContext* This,
+    UINT StartSlot,
+    UINT NumViews,
+    ID3D11ShaderResourceView* const* ppShaderResourceViews
+) {
+    ID3D11ShaderResourceView* swappedViews[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = { 0 };
+    bool modified = false;
+
+    if (ppShaderResourceViews && NumViews > 0) {
+        for (UINT i = 0; i < NumViews; ++i) {
+            swappedViews[i] = ppShaderResourceViews[i];
+            ID3D11ShaderResourceView* pSRV = ppShaderResourceViews[i];
+            if (pSRV) {
+                ID3D11Resource* pRes = nullptr;
+                pSRV->GetResource(&pRes);
+                if (pRes) {
+                    std::wstring assetName = L"";
+                    auto itName = g_ResourceAssetNames.find(pRes);
+                    if (itName != g_ResourceAssetNames.end()) {
+                        assetName = itName->second;
+                    }
+
+                    ID3D11Texture2D* pTex = nullptr;
+                    if (SUCCEEDED(pRes->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&pTex)) && pTex) {
+                        D3D11_TEXTURE2D_DESC desc = {};
+                        pTex->GetDesc(&desc);
+                        if (!assetName.empty()) {
+                            Log("[Loader] PSSetShaderResources: Slot=%u, SRV=%p, Resource=%p, Asset=%S, Size=%ux%u, Format=%d\n",
+                                StartSlot + i, pSRV, pRes, assetName.c_str(), desc.Width, desc.Height, desc.Format);
+                        } else {
+                            if (desc.Width >= 256 && desc.Height >= 256) {
+                                Log("[Loader] PSSetShaderResources: Slot=%u, SRV=%p, Resource=%p, Size=%ux%u, Format=%d\n",
+                                    StartSlot + i, pSRV, pRes, desc.Width, desc.Height, desc.Format);
+                            }
+                        }
+                        pTex->Release();
+                    }
+
+                    int sheetIndex = -1;
+                    auto it = g_CanvasResourceSheets.find(pRes);
+                    if (it != g_CanvasResourceSheets.end()) {
+                        sheetIndex = it->second;
+                    } else if (!assetName.empty()) {
+                        if (assetName.find(L"_canvas") != std::wstring::npos) {
+                            sheetIndex = g_ActiveSheetIndex;
+                        }
+                    }
+
+                    if (sheetIndex >= 0) {
+                        auto itSRV = g_StitchedCanvasSRVs.find(sheetIndex);
+                        if (itSRV != g_StitchedCanvasSRVs.end() && itSRV->second != nullptr) {
+                            swappedViews[i] = itSRV->second;
+                            modified = true;
+                            Log("[Loader] PSSetShaderResources: Swapped canvas SRV %p with stitched SRV %p (sheet %d) in slot %u\n",
+                                pSRV, itSRV->second, sheetIndex, StartSlot + i);
+                        } else {
+                            Log("[Loader] PSSetShaderResources: Found canvas resource %p (sheet %d), but stitched SRV is NULL\n",
+                                pRes, sheetIndex);
+                        }
+                    }
+                    pRes->Release();
+                }
+            }
+        }
+    }
+
+    if (modified) {
+        OriginalPSSetShaderResources(This, StartSlot, NumViews, swappedViews);
+    } else {
+        OriginalPSSetShaderResources(This, StartSlot, NumViews, ppShaderResourceViews);
+    }
 }
 
 HRESULT STDMETHODCALLTYPE HookedCreateShaderResourceView(
@@ -801,25 +1499,35 @@ HRESULT STDMETHODCALLTYPE HookedCreateShaderResourceView(
         if (SUCCEEDED(hrTag) && assetNameBuf[0] != L'\0') {
             std::wstring assetName = assetNameBuf;
             Log("[Loader] HookedCreateShaderResourceView: Found tagged resource %S\n", assetName.c_str());
-            std::wstring overridePath = ResolveTextureOverride(assetName);
-            if (!overridePath.empty()) {
-                Log("[Loader] Resolving override for %S -> %S\n", assetName.c_str(), overridePath.c_str());
-                ID3D11Texture2D* pOverrideTex = nullptr;
-                HRESULT hrLoad = LoadOverrideTexture(This, overridePath, D3D11_BIND_SHADER_RESOURCE, &pOverrideTex);
-                if (SUCCEEDED(hrLoad) && pOverrideTex) {
-                    HRESULT hrSRV = This->CreateShaderResourceView(pOverrideTex, pDesc, ppSRV);
-                    pOverrideTex->Release();
-                    if (SUCCEEDED(hrSRV)) {
-                        Log("[Loader] Swapped ShaderResourceView for background %S to high-res override SRV %p\n", assetName.c_str(), *ppSRV);
-                        return S_OK;
+            
+            // Canvas textures are already swapped in CreateTexture2D, so we don't swap them again here.
+            if (assetName.find(L"_canvas") == std::wstring::npos) {
+                int quadIndex = ParseQuadrantIndex(assetName);
+                if (quadIndex >= 0) {
+                    g_ActiveSheetIndex = quadIndex / 16;
+                }
+                std::wstring overridePath = ResolveTextureOverride(assetName);
+                if (!overridePath.empty()) {
+                    Log("[Loader] Resolving override for %S -> %S\n", assetName.c_str(), overridePath.c_str());
+                    ID3D11Texture2D* pOverrideTex = nullptr;
+                    HRESULT hrLoad = LoadOverrideTexture(This, overridePath, D3D11_BIND_SHADER_RESOURCE, &pOverrideTex);
+                    if (SUCCEEDED(hrLoad) && pOverrideTex) {
+                        pOverrideTex->SetPrivateData(GUID_BackgroundAssetName, (UINT)((assetName.length() + 1) * sizeof(wchar_t)), assetName.c_str());
+                        g_ResourceAssetNames[pOverrideTex] = assetName;
+                        HRESULT hrSRV = OriginalCreateShaderResourceView(This, pOverrideTex, pDesc, ppSRV);
+                        pOverrideTex->Release();
+                        if (SUCCEEDED(hrSRV)) {
+                            Log("[Loader] Swapped ShaderResourceView for background %S to high-res override SRV %p\n", assetName.c_str(), *ppSRV);
+                            return S_OK;
+                        } else {
+                            Log("[Loader] ERROR: CreateShaderResourceView failed for override background %S: 0x%08X\n", assetName.c_str(), hrSRV);
+                        }
                     } else {
-                        Log("[Loader] ERROR: CreateShaderResourceView failed for override background %S: 0x%08X\n", assetName.c_str(), hrSRV);
+                        Log("[Loader] ERROR: LoadOverrideTexture failed for background SRV override %S: 0x%08X\n", assetName.c_str(), hrLoad);
                     }
                 } else {
-                    Log("[Loader] ERROR: LoadOverrideTexture failed for background SRV override %S: 0x%08X\n", assetName.c_str(), hrLoad);
+                    Log("[Loader] No override found for background asset %S\n", assetName.c_str());
                 }
-            } else {
-                Log("[Loader] No override found for background asset %S\n", assetName.c_str());
             }
         }
     }
@@ -857,11 +1565,15 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 assetName = g_CurrentStageTexName;
                 g_CurrentStageTexName = L""; // Consume and clear immediately to prevent matching subsequent static textures!
             }
-        } else if (!g_ActiveFieldName.empty() && g_FieldTextureCounter < 4 && pDesc->Usage == 2 && pDesc->BindFlags == 8 && pDesc->Width == 256 && pDesc->Height == 256) {
+        } else if (!g_ActiveFieldName.empty() && g_ActiveFieldName != L"maplist" && g_ActiveFieldName != L"flevel" && g_FieldTextureCounter < 4 && pDesc->Usage == 2 && pDesc->BindFlags == 8 && pDesc->Width == 256 && pDesc->Height == 256) {
             wchar_t fieldTexName[64];
             swprintf_s(fieldTexName, L"%s_%02d_00", g_ActiveFieldName.c_str(), g_FieldTextureCounter);
             assetName = fieldTexName;
             g_FieldTextureCounter++;
+        } else if (!g_ActiveFieldName.empty() && (!g_FieldMapLoaded || (g_LastMapFileReadTime != 0 && GetTickCount64() - g_LastMapFileReadTime < 5000)) && g_ActiveFieldName != L"maplist" && g_ActiveFieldName != L"flevel" && pDesc->Width == 1024 && pDesc->Height == 1024 && pDesc->Usage == 0 && pDesc->BindFlags == 40) {
+            wchar_t canvasTexName[64];
+            swprintf_s(canvasTexName, L"%s_canvas", g_ActiveFieldName.c_str());
+            assetName = canvasTexName;
         }
 
         if (!assetName.empty()) {
@@ -878,28 +1590,34 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
     }
     HRESULT hr = OriginalCreateTexture2D(This, pDesc, pInitialData, ppTexture2D);
     if (SUCCEEDED(hr) && ppTexture2D && *ppTexture2D && !assetName.empty()) {
-        std::wstring overridePath = ResolveTextureOverride(assetName);
-        if (!overridePath.empty()) {
-            if (pDesc->Usage == 0) {
-                ID3D11Texture2D* pOverrideTex = nullptr;
-                HRESULT hrLoad = LoadOverrideTexture(This, overridePath, pDesc->BindFlags, &pOverrideTex);
-                if (SUCCEEDED(hrLoad) && pOverrideTex) {
-                    (*ppTexture2D)->Release();
-                    *ppTexture2D = pOverrideTex;
-                    Log("[Loader] Swapped static texture %S in CreateTexture2D: Override=%p\n", assetName.c_str(), pOverrideTex);
-                } else {
-                    Log("[Loader] ERROR: LoadOverrideTexture failed for path %S: 0x%08X\n", overridePath.c_str(), hrLoad);
+        if (assetName.find(L"_canvas") != std::wstring::npos) {
+            // Let the canvas be created normally at its original size.
+            // It will be tagged with its name in the tagging block below.
+        } else {
+            std::wstring overridePath = ResolveTextureOverride(assetName);
+            if (!overridePath.empty()) {
+                if (pDesc->Usage == 0) {
+                    ID3D11Texture2D* pOverrideTex = nullptr;
+                    HRESULT hrLoad = LoadOverrideTexture(This, overridePath, pDesc->BindFlags, &pOverrideTex);
+                    if (SUCCEEDED(hrLoad) && pOverrideTex) {
+                        (*ppTexture2D)->Release();
+                        *ppTexture2D = pOverrideTex;
+                        Log("[Loader] Swapped static texture %S in CreateTexture2D: Override=%p\n", assetName.c_str(), pOverrideTex);
+                    } else {
+                        Log("[Loader] ERROR: LoadOverrideTexture failed for path %S: 0x%08X\n", overridePath.c_str(), hrLoad);
+                    }
                 }
             }
         }
         
-        // Tag dynamic background quadrants
-        if (pDesc->Usage == 2) {
+        // Tag dynamic background quadrants and static canvas textures
+        if (pDesc->Usage == 2 || (pDesc->Width == 1024 && pDesc->Height == 1024)) {
             bool isBg = false;
             if (!g_ActiveFieldName.empty() && assetName.find(g_ActiveFieldName) == 0) {
                 isBg = true;
             }
             if (isBg) {
+                g_ResourceAssetNames[*ppTexture2D] = assetName;
                 HRESULT hrTag = (*ppTexture2D)->SetPrivateData(GUID_BackgroundAssetName, (UINT)((assetName.length() + 1) * sizeof(wchar_t)), assetName.c_str());
                 if (SUCCEEDED(hrTag)) {
                     Log("[Loader] Tagged dynamic background texture %S in CreateTexture2D: %p\n", assetName.c_str(), *ppTexture2D);
@@ -945,16 +1663,22 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
     if (SUCCEEDED(hr)) {
         if (ppDevice && *ppDevice) {
             ID3D11Device* pDevice = *ppDevice;
-            if (!OriginalCreateTexture2D) {
-                Log("[Loader] Hooking ID3D11Device::CreateTexture2D via VMT...\n");
-                OriginalCreateTexture2D = (CreateTexture2D_t)HookVMT(pDevice, 5, HookedCreateTexture2D);
-                Log("[Loader] ID3D11Device::CreateTexture2D Hooked via VMT! Original: %p\n", OriginalCreateTexture2D);
-            }
-            if (!OriginalCreateShaderResourceView) {
-                Log("[Loader] Hooking ID3D11Device::CreateShaderResourceView via VMT...\n");
-                OriginalCreateShaderResourceView = (CreateShaderResourceView_t)HookVMT(pDevice, 7, HookedCreateShaderResourceView);
-                Log("[Loader] ID3D11Device::CreateShaderResourceView Hooked via VMT! Original: %p\n", OriginalCreateShaderResourceView);
-            }
+            HookDeviceMethod(pDevice, 5, HookedCreateTexture2D, (void**)&OriginalCreateTexture2D);
+            HookDeviceMethod(pDevice, 7, HookedCreateShaderResourceView, (void**)&OriginalCreateShaderResourceView);
+        }
+        if (ppImmediateContext && *ppImmediateContext) {
+            ID3D11DeviceContext* pContext = *ppImmediateContext;
+            HookContextMethod(pContext, 46, HookedCopySubresourceRegion, (void**)&OriginalCopySubresourceRegion);
+            HookContextMethod(pContext, 47, HookedCopyResource, (void**)&OriginalCopyResource);
+            HookContextMethod(pContext, 57, HookedResolveSubresource, (void**)&OriginalResolveSubresource);
+            HookContextMethod(pContext, 8, HookedPSSetShaderResources, (void**)&OriginalPSSetShaderResources);
+            HookContextMethod(pContext, 12, HookedDrawIndexed, (void**)&OriginalDrawIndexed);
+            HookContextMethod(pContext, 13, HookedDraw, (void**)&OriginalDraw);
+            HookContextMethod(pContext, 20, HookedDrawIndexedInstanced, (void**)&OriginalDrawIndexedInstanced);
+            HookContextMethod(pContext, 21, HookedDrawInstanced, (void**)&OriginalDrawInstanced);
+            HookContextMethod(pContext, 33, HookedOMSetRenderTargets, (void**)&OriginalOMSetRenderTargets);
+            HookContextMethod(pContext, 34, HookedOMSetRenderTargetsAndUnorderedAccessViews, (void**)&OriginalOMSetRenderTargetsAndUnorderedAccessViews);
+            Log("[Loader] ID3D11DeviceContext hooks initialized via detours!\n");
         }
         if (ppSwapChain && *ppSwapChain) {
             IDXGISwapChain* pSwapChain = *ppSwapChain;
@@ -2447,10 +3171,19 @@ void TrackActiveFieldFromName(const std::wstring& path) {
         
         std::wstring fieldName = (endPos != std::wstring::npos) ? sub.substr(0, endPos) : sub;
         if (!fieldName.empty() && fieldName != L"char" && fieldName != L"flevel" && fieldName.find(L".tex") == std::wstring::npos) {
+            g_LastMapFileReadTime = GetTickCount64();
             if (fieldName != g_ActiveFieldName) {
                 g_ActiveFieldName = fieldName;
                 g_ActiveStageName = L""; // Clear active battle stage!
                 g_FieldTextureCounter = 0;
+                g_FieldMapLoaded = false;
+                g_MapLoadStartTime = GetTickCount64();
+                g_CanvasCount = 0;
+                for (auto& pair : g_CachedStitchedCanvases) {
+                    if (pair.second) pair.second->Release();
+                }
+                g_CachedStitchedCanvases.clear();
+                g_CachedFieldName = L"";
                 Log("[Loader] Active field map set from loose path to: %S\n", g_ActiveFieldName.c_str());
             }
         }
@@ -2856,6 +3589,7 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
             }
         } else {
             if (archivePathLower.find(L"flevel.lgp") != std::wstring::npos) {
+                g_LastMapFileReadTime = GetTickCount64();
                 if (entryNameLower.find(L".tex") == std::wstring::npos) { // Only map files, not character textures
                     size_t dotPos = entryNameLower.find(L".");
                     std::wstring fieldName = (dotPos != std::wstring::npos) ? entryNameLower.substr(0, dotPos) : entryNameLower;
@@ -2864,6 +3598,10 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
                             g_ActiveFieldName = fieldName;
                             g_ActiveStageName = L""; // Clear active battle stage!
                             g_FieldTextureCounter = 0;
+                            g_FieldMapLoaded = false;
+                            g_MapLoadStartTime = GetTickCount64();
+                            ClearCachedStitchedCanvases();
+                            g_CachedFieldName = L"";
                             Log("[Loader] Active field map set to: %S\n", g_ActiveFieldName.c_str());
                         }
                     }
