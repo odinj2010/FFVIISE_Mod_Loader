@@ -774,11 +774,9 @@ HRESULT LoadOverrideTexture(ID3D11Device* pDevice, const std::wstring& filePath,
     return E_FAIL;
 }
 
-#include <unordered_set>
-#include <mutex>
-
-std::unordered_set<ID3D11Resource*> g_BackgroundTextures;
-std::recursive_mutex g_BackgroundTexturesMutex;
+// {C4B13271-9B50-4822-8611-6644400E71FF}
+static const GUID GUID_IsBackgroundTexture = 
+{ 0xc4b13271, 0x9b50, 0x4822, { 0x86, 0x11, 0x66, 0x44, 0x40, 0xe, 0x71, 0xff } };
 
 typedef HRESULT (STDMETHODCALLTYPE *Map_t)(
     ID3D11DeviceContext* This,
@@ -819,22 +817,18 @@ HRESULT STDMETHODCALLTYPE HookedMap(
     UINT MapFlags,
     D3D11_MAPPED_SUBRESOURCE* pMappedResource
 ) {
-    bool isBackground = false;
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_BackgroundTexturesMutex);
-        if (g_BackgroundTextures.find(pResource) != g_BackgroundTextures.end()) {
-            isBackground = true;
+    if (pResource) {
+        BOOL isBackground = FALSE;
+        UINT dataSize = sizeof(BOOL);
+        if (SUCCEEDED(pResource->GetPrivateData(GUID_IsBackgroundTexture, &dataSize, &isBackground)) && isBackground) {
+            if (t_DummyBuffer.size() < 256 * 256 * 4) {
+                t_DummyBuffer.resize(256 * 256 * 4, 0);
+            }
+            pMappedResource->pData = t_DummyBuffer.data();
+            pMappedResource->RowPitch = 256 * 4;
+            pMappedResource->DepthPitch = 256 * 256 * 4;
+            return S_OK;
         }
-    }
-
-    if (isBackground) {
-        if (t_DummyBuffer.size() < 256 * 256 * 4) {
-            t_DummyBuffer.resize(256 * 256 * 4, 0);
-        }
-        pMappedResource->pData = t_DummyBuffer.data();
-        pMappedResource->RowPitch = 256 * 4;
-        pMappedResource->DepthPitch = 256 * 256 * 4;
-        return S_OK;
     }
 
     return OriginalMap(This, pResource, Subresource, MapType, MapFlags, pMappedResource);
@@ -845,16 +839,12 @@ void STDMETHODCALLTYPE HookedUnmap(
     ID3D11Resource* pResource,
     UINT Subresource
 ) {
-    bool isBackground = false;
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_BackgroundTexturesMutex);
-        if (g_BackgroundTextures.find(pResource) != g_BackgroundTextures.end()) {
-            isBackground = true;
+    if (pResource) {
+        BOOL isBackground = FALSE;
+        UINT dataSize = sizeof(BOOL);
+        if (SUCCEEDED(pResource->GetPrivateData(GUID_IsBackgroundTexture, &dataSize, &isBackground)) && isBackground) {
+            return;
         }
-    }
-
-    if (isBackground) {
-        return;
     }
 
     OriginalUnmap(This, pResource, Subresource);
@@ -869,16 +859,12 @@ void STDMETHODCALLTYPE HookedUpdateSubresource(
     UINT SrcRowPitch,
     UINT SrcDepthPitch
 ) {
-    bool isBackground = false;
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_BackgroundTexturesMutex);
-        if (g_BackgroundTextures.find(pDstResource) != g_BackgroundTextures.end()) {
-            isBackground = true;
+    if (pDstResource) {
+        BOOL isBackground = FALSE;
+        UINT dataSize = sizeof(BOOL);
+        if (SUCCEEDED(pDstResource->GetPrivateData(GUID_IsBackgroundTexture, &dataSize, &isBackground)) && isBackground) {
+            return;
         }
-    }
-
-    if (isBackground) {
-        return;
     }
 
     OriginalUpdateSubresource(This, pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
@@ -956,8 +942,8 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                     *ppTexture2D = pOverrideTex;
                     Log("[Loader] Swapped dynamic background texture %S in CreateTexture2D: Override=%p\n", assetName.c_str(), pOverrideTex);
 
-                    std::lock_guard<std::recursive_mutex> lock(g_BackgroundTexturesMutex);
-                    g_BackgroundTextures.insert(pOverrideTex);
+                    BOOL isBg = TRUE;
+                    pOverrideTex->SetPrivateData(GUID_IsBackgroundTexture, sizeof(BOOL), &isBg);
                 } else {
                     Log("[Loader] ERROR: LoadOverrideTexture failed for dynamic background %S: 0x%08X\n", overridePath.c_str(), hrLoad);
                 }
