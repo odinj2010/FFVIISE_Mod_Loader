@@ -52,6 +52,47 @@ DWORD WINAPI HookedGetFileAttributesW(LPCWSTR lpFileName);
 DWORD WINAPI HookedGetFileAttributesA(LPCSTR lpFileName);
 BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation);
 
+HANDLE WINAPI HookedCreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile
+);
+HANDLE WINAPI HookedCreateFileA(
+    LPCSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile
+);
+
+typedef HANDLE (WINAPI* CreateFileW_t)(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile
+);
+CreateFileW_t OriginalCreateFileW = nullptr;
+
+typedef HANDLE (WINAPI* CreateFileA_t)(
+    LPCSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile
+);
+CreateFileA_t OriginalCreateFileA = nullptr;
+
 typedef DWORD (WINAPI* GetFileAttributesW_t)(LPCWSTR lpFileName);
 GetFileAttributesW_t OriginalGetFileAttributesW = nullptr;
 
@@ -1738,12 +1779,14 @@ void InitializeHooks() {
             Log("[Loader] Failed to load/locate d3d11.dll\n");
         }
 
-        // Hook GetFileAttributesW/A/ExW to mock existence of layout_pc backgrounds inside mods
+        // Hook GetFileAttributesW/A/ExW and CreateFileW/A to mock existence of layout_pc backgrounds inside mods
         HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
         if (hKernel32) {
             void* targetGetAttributesW = (void*)GetProcAddress(hKernel32, "GetFileAttributesW");
             void* targetGetAttributesA = (void*)GetProcAddress(hKernel32, "GetFileAttributesA");
             void* targetGetAttributesExW = (void*)GetProcAddress(hKernel32, "GetFileAttributesExW");
+            void* targetCreateFileW = (void*)GetProcAddress(hKernel32, "CreateFileW");
+            void* targetCreateFileA = (void*)GetProcAddress(hKernel32, "CreateFileA");
 
             if (targetGetAttributesW) {
                 MH_STATUS status = MH_CreateHook(targetGetAttributesW, (LPVOID)&HookedGetFileAttributesW, (LPVOID*)&OriginalGetFileAttributesW);
@@ -1756,6 +1799,14 @@ void InitializeHooks() {
             if (targetGetAttributesExW) {
                 MH_STATUS status = MH_CreateHook(targetGetAttributesExW, (LPVOID)&HookedGetFileAttributesExW, (LPVOID*)&OriginalGetFileAttributesExW);
                 Log("[Loader] Hooked GetFileAttributesExW. Status: %d\n", status);
+            }
+            if (targetCreateFileW) {
+                MH_STATUS status = MH_CreateHook(targetCreateFileW, (LPVOID)&HookedCreateFileW, (LPVOID*)&OriginalCreateFileW);
+                Log("[Loader] Hooked CreateFileW. Status: %d\n", status);
+            }
+            if (targetCreateFileA) {
+                MH_STATUS status = MH_CreateHook(targetCreateFileA, (LPVOID)&HookedCreateFileA, (LPVOID*)&OriginalCreateFileA);
+                Log("[Loader] Hooked CreateFileA. Status: %d\n", status);
             }
         }
 
@@ -2405,6 +2456,150 @@ BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVEL
         }
     }
     return OriginalGetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
+}
+
+HANDLE WINAPI HookedCreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile
+) {
+    if (lpFileName) {
+        std::wstring absPath = GetFullPathSafe(lpFileName);
+        if (!absPath.empty()) {
+            std::wstring pathStr = absPath;
+            std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
+            std::wstring originalPath = pathStr;
+            std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
+
+            size_t dataPos = pathStr.find(L"\\data\\");
+            if (dataPos != std::wstring::npos) {
+                size_t prefixLen = 6;
+                size_t workingDirPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
+                if (workingDirPos != std::wstring::npos && workingDirPos <= dataPos) {
+                    prefixLen = 21;
+                    dataPos = workingDirPos;
+                }
+                std::wstring relPath = originalPath.substr(dataPos + prefixLen);
+                std::wstring overridePath = ResolveModPath(relPath);
+
+                if (overridePath.empty()) {
+                    overridePath = ResolveModDirectoryPath(relPath);
+                }
+
+                // If it starts with layout_pc flevel also try matching field
+                if (overridePath.empty()) {
+                    std::wstring lowerRel = relPath;
+                    std::transform(lowerRel.begin(), lowerRel.end(), lowerRel.begin(), ::towlower);
+                    if (lowerRel.rfind(L"layout_pc\\flevel\\", 0) == 0) {
+                        std::wstring fieldRelPath = L"field\\" + relPath.substr(17);
+                        overridePath = ResolveModPath(fieldRelPath);
+                        if (overridePath.empty()) {
+                            overridePath = ResolveModDirectoryPath(fieldRelPath);
+                        }
+                    }
+                }
+
+                if (!overridePath.empty()) {
+                    Log("[Loader] [Redirect] CreateFileW redirected: %S -> %S\n", lpFileName, overridePath.c_str());
+                    return OriginalCreateFileW(
+                        overridePath.c_str(),
+                        dwDesiredAccess,
+                        dwShareMode,
+                        lpSecurityAttributes,
+                        dwCreationDisposition,
+                        dwFlagsAndAttributes,
+                        hTemplateFile
+                    );
+                }
+            }
+        }
+    }
+    return OriginalCreateFileW(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile
+    );
+}
+
+HANDLE WINAPI HookedCreateFileA(
+    LPCSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile
+) {
+    if (lpFileName) {
+        std::wstring wFilename = AnsiToWide(lpFileName);
+        std::wstring absPath = GetFullPathSafe(wFilename);
+        if (!absPath.empty()) {
+            std::wstring pathStr = absPath;
+            std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
+            std::wstring originalPath = pathStr;
+            std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
+
+            size_t dataPos = pathStr.find(L"\\data\\");
+            if (dataPos != std::wstring::npos) {
+                size_t prefixLen = 6;
+                size_t workingDirPos = pathStr.find(L"\\ff7\\workingdir\\data\\");
+                if (workingDirPos != std::wstring::npos && workingDirPos <= dataPos) {
+                    prefixLen = 21;
+                    dataPos = workingDirPos;
+                }
+                std::wstring relPath = originalPath.substr(dataPos + prefixLen);
+                std::wstring overridePath = ResolveModPath(relPath);
+
+                if (overridePath.empty()) {
+                    overridePath = ResolveModDirectoryPath(relPath);
+                }
+
+                // If it starts with layout_pc flevel also try matching field
+                if (overridePath.empty()) {
+                    std::wstring lowerRel = relPath;
+                    std::transform(lowerRel.begin(), lowerRel.end(), lowerRel.begin(), ::towlower);
+                    if (lowerRel.rfind(L"layout_pc\\flevel\\", 0) == 0) {
+                        std::wstring fieldRelPath = L"field\\" + relPath.substr(17);
+                        overridePath = ResolveModPath(fieldRelPath);
+                        if (overridePath.empty()) {
+                            overridePath = ResolveModDirectoryPath(fieldRelPath);
+                        }
+                    }
+                }
+
+                if (!overridePath.empty()) {
+                    std::string cOverridePath = WideToAnsi(overridePath);
+                    Log("[Loader] [Redirect] CreateFileA redirected: %s -> %s\n", lpFileName, cOverridePath.c_str());
+                    return OriginalCreateFileA(
+                        cOverridePath.c_str(),
+                        dwDesiredAccess,
+                        dwShareMode,
+                        lpSecurityAttributes,
+                        dwCreationDisposition,
+                        dwFlagsAndAttributes,
+                        hTemplateFile
+                    );
+                }
+            }
+        }
+    }
+    return OriginalCreateFileA(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile
+    );
 }
 
 
