@@ -774,100 +774,49 @@ HRESULT LoadOverrideTexture(ID3D11Device* pDevice, const std::wstring& filePath,
     return E_FAIL;
 }
 
-// {C4B13271-9B50-4822-8611-6644400E71FF}
-static const GUID GUID_IsBackgroundTexture = 
-{ 0xc4b13271, 0x9b50, 0x4822, { 0x86, 0x11, 0x66, 0x44, 0x40, 0xe, 0x71, 0xff } };
+// {E485FBA9-7EBE-4F16-B0B4-2E824F35C7A2}
+static const GUID GUID_BackgroundAssetName = 
+{ 0xe485fba9, 0x7ebe, 0x4f16, { 0xb0, 0xb4, 0x2e, 0x82, 0x4f, 0x35, 0xc7, 0xa2 } };
 
-typedef HRESULT (STDMETHODCALLTYPE *Map_t)(
-    ID3D11DeviceContext* This,
+typedef HRESULT (STDMETHODCALLTYPE *CreateShaderResourceView_t)(
+    ID3D11Device* This,
     ID3D11Resource* pResource,
-    UINT Subresource,
-    D3D11_MAP MapType,
-    UINT MapFlags,
-    D3D11_MAPPED_SUBRESOURCE* pMappedResource
+    const D3D11_SHADER_RESOURCE_VIEW_DESC* pDesc,
+    ID3D11ShaderResourceView** ppSRV
 );
-Map_t OriginalMap = nullptr;
+CreateShaderResourceView_t OriginalCreateShaderResourceView = nullptr;
 
-typedef void (STDMETHODCALLTYPE *Unmap_t)(
-    ID3D11DeviceContext* This,
+HRESULT STDMETHODCALLTYPE HookedCreateShaderResourceView(
+    ID3D11Device* This,
     ID3D11Resource* pResource,
-    UINT Subresource
-);
-Unmap_t OriginalUnmap = nullptr;
-
-typedef void (STDMETHODCALLTYPE *UpdateSubresource_t)(
-    ID3D11DeviceContext* This,
-    ID3D11Resource* pDstResource,
-    UINT DstSubresource,
-    const D3D11_BOX* pDstBox,
-    const void* pSrcData,
-    UINT SrcRowPitch,
-    UINT SrcDepthPitch
-);
-UpdateSubresource_t OriginalUpdateSubresource = nullptr;
-
-// Thread-local dummy buffer for Map writes
-thread_local std::vector<BYTE> t_DummyBuffer;
-
-HRESULT STDMETHODCALLTYPE HookedMap(
-    ID3D11DeviceContext* This,
-    ID3D11Resource* pResource,
-    UINT Subresource,
-    D3D11_MAP MapType,
-    UINT MapFlags,
-    D3D11_MAPPED_SUBRESOURCE* pMappedResource
+    const D3D11_SHADER_RESOURCE_VIEW_DESC* pDesc,
+    ID3D11ShaderResourceView** ppSRV
 ) {
-    if (pResource) {
-        BOOL isBackground = FALSE;
-        UINT dataSize = sizeof(BOOL);
-        if (SUCCEEDED(pResource->GetPrivateData(GUID_IsBackgroundTexture, &dataSize, &isBackground)) && isBackground) {
-            if (t_DummyBuffer.size() < 256 * 256 * 4) {
-                t_DummyBuffer.resize(256 * 256 * 4, 0);
+    if (pResource && ppSRV) {
+        wchar_t assetNameBuf[128] = { 0 };
+        UINT dataSize = sizeof(assetNameBuf) - sizeof(wchar_t);
+        if (SUCCEEDED(pResource->GetPrivateData(GUID_BackgroundAssetName, &dataSize, assetNameBuf)) && assetNameBuf[0] != L'\0') {
+            std::wstring assetName = assetNameBuf;
+            std::wstring overridePath = ResolveTextureOverride(assetName);
+            if (!overridePath.empty()) {
+                ID3D11Texture2D* pOverrideTex = nullptr;
+                HRESULT hrLoad = LoadOverrideTexture(This, overridePath, D3D11_BIND_SHADER_RESOURCE, &pOverrideTex);
+                if (SUCCEEDED(hrLoad) && pOverrideTex) {
+                    HRESULT hrSRV = This->CreateShaderResourceView(pOverrideTex, nullptr, ppSRV);
+                    pOverrideTex->Release();
+                    if (SUCCEEDED(hrSRV)) {
+                        Log("[Loader] Swapped ShaderResourceView for background %S to high-res override SRV %p\n", assetName.c_str(), *ppSRV);
+                        return S_OK;
+                    } else {
+                        Log("[Loader] ERROR: CreateShaderResourceView failed for override background %S: 0x%08X\n", assetName.c_str(), hrSRV);
+                    }
+                } else {
+                    Log("[Loader] ERROR: LoadOverrideTexture failed for background SRV override %S: 0x%08X\n", assetName.c_str(), hrLoad);
+                }
             }
-            pMappedResource->pData = t_DummyBuffer.data();
-            pMappedResource->RowPitch = 256 * 4;
-            pMappedResource->DepthPitch = 256 * 256 * 4;
-            return S_OK;
         }
     }
-
-    return OriginalMap(This, pResource, Subresource, MapType, MapFlags, pMappedResource);
-}
-
-void STDMETHODCALLTYPE HookedUnmap(
-    ID3D11DeviceContext* This,
-    ID3D11Resource* pResource,
-    UINT Subresource
-) {
-    if (pResource) {
-        BOOL isBackground = FALSE;
-        UINT dataSize = sizeof(BOOL);
-        if (SUCCEEDED(pResource->GetPrivateData(GUID_IsBackgroundTexture, &dataSize, &isBackground)) && isBackground) {
-            return;
-        }
-    }
-
-    OriginalUnmap(This, pResource, Subresource);
-}
-
-void STDMETHODCALLTYPE HookedUpdateSubresource(
-    ID3D11DeviceContext* This,
-    ID3D11Resource* pDstResource,
-    UINT DstSubresource,
-    const D3D11_BOX* pDstBox,
-    const void* pSrcData,
-    UINT SrcRowPitch,
-    UINT SrcDepthPitch
-) {
-    if (pDstResource) {
-        BOOL isBackground = FALSE;
-        UINT dataSize = sizeof(BOOL);
-        if (SUCCEEDED(pDstResource->GetPrivateData(GUID_IsBackgroundTexture, &dataSize, &isBackground)) && isBackground) {
-            return;
-        }
-    }
-
-    OriginalUpdateSubresource(This, pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
+    return OriginalCreateShaderResourceView(This, pResource, pDesc, ppSRV);
 }
 
 HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
@@ -935,17 +884,11 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                     Log("[Loader] ERROR: LoadOverrideTexture failed for path %S: 0x%08X\n", overridePath.c_str(), hrLoad);
                 }
             } else if (pDesc->Usage == 2) {
-                ID3D11Texture2D* pOverrideTex = nullptr;
-                HRESULT hrLoad = LoadOverrideTexture(This, overridePath, pDesc->BindFlags, &pOverrideTex);
-                if (SUCCEEDED(hrLoad) && pOverrideTex) {
-                    (*ppTexture2D)->Release();
-                    *ppTexture2D = pOverrideTex;
-                    Log("[Loader] Swapped dynamic background texture %S in CreateTexture2D: Override=%p\n", assetName.c_str(), pOverrideTex);
-
-                    BOOL isBg = TRUE;
-                    pOverrideTex->SetPrivateData(GUID_IsBackgroundTexture, sizeof(BOOL), &isBg);
+                HRESULT hrTag = (*ppTexture2D)->SetPrivateData(GUID_BackgroundAssetName, (UINT)((assetName.length() + 1) * sizeof(wchar_t)), assetName.c_str());
+                if (SUCCEEDED(hrTag)) {
+                    Log("[Loader] Tagged dynamic texture with background asset name %S in CreateTexture2D: %p\n", assetName.c_str(), *ppTexture2D);
                 } else {
-                    Log("[Loader] ERROR: LoadOverrideTexture failed for dynamic background %S: 0x%08X\n", overridePath.c_str(), hrLoad);
+                    Log("[Loader] ERROR: SetPrivateData failed for dynamic background tag %S: 0x%08X\n", assetName.c_str(), hrTag);
                 }
             }
         }
@@ -991,15 +934,10 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
                 OriginalCreateTexture2D = (CreateTexture2D_t)HookVMT(pDevice, 5, HookedCreateTexture2D);
                 Log("[Loader] ID3D11Device::CreateTexture2D Hooked via VMT! Original: %p\n", OriginalCreateTexture2D);
             }
-        }
-        if (ppImmediateContext && *ppImmediateContext) {
-            ID3D11DeviceContext* pContext = *ppImmediateContext;
-            if (!OriginalMap) {
-                Log("[Loader] Hooking ID3D11DeviceContext::Map via VMT...\n");
-                OriginalMap = (Map_t)HookVMT(pContext, 14, HookedMap);
-                OriginalUnmap = (Unmap_t)HookVMT(pContext, 15, HookedUnmap);
-                OriginalUpdateSubresource = (UpdateSubresource_t)HookVMT(pContext, 48, HookedUpdateSubresource);
-                Log("[Loader] ID3D11DeviceContext Map/Unmap/UpdateSubresource Hooked via VMT!\n");
+            if (!OriginalCreateShaderResourceView) {
+                Log("[Loader] Hooking ID3D11Device::CreateShaderResourceView via VMT...\n");
+                OriginalCreateShaderResourceView = (CreateShaderResourceView_t)HookVMT(pDevice, 7, HookedCreateShaderResourceView);
+                Log("[Loader] ID3D11Device::CreateShaderResourceView Hooked via VMT! Original: %p\n", OriginalCreateShaderResourceView);
             }
         }
         if (ppSwapChain && *ppSwapChain) {
