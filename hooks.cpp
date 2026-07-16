@@ -139,6 +139,8 @@ std::wstring g_ActiveStageName = L"";
 int g_StageTextureCounter = 0;
 int g_MaxStageTextures = 0;
 std::wstring g_CurrentStageTexName = L"";
+std::wstring g_ActiveFieldName = L"";
+int g_FieldTextureCounter = 0;
 bool g_EnableTextureLogging = false;
 bool g_DisableD3D11Hooks = false;
 // Direct3D 11 Context hook declarations removed
@@ -724,6 +726,24 @@ std::wstring ResolveTextureOverride(const std::wstring& assetName) {
         baseName = baseName.substr(0, dotPos);
     }
 
+    if (!g_ActiveFieldName.empty() && baseName.find(g_ActiveFieldName) == 0) {
+        for (const auto& modFolder : g_ActiveMods) {
+            // Check under /layout_pc/flevel/<fieldname>/
+            std::wstring layoutPngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\layout_pc\\flevel\\" + g_ActiveFieldName + L"\\" + baseName + L".png";
+            if (FileExists(layoutPngPath)) return layoutPngPath;
+
+            std::wstring layoutDdsPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\layout_pc\\flevel\\" + g_ActiveFieldName + L"\\" + baseName + L".dds";
+            if (FileExists(layoutDdsPath)) return layoutDdsPath;
+
+            // Check under /field/<fieldname>/
+            std::wstring fieldPngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\field\\" + g_ActiveFieldName + L"\\" + baseName + L".png";
+            if (FileExists(fieldPngPath)) return fieldPngPath;
+
+            std::wstring fieldDdsPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\field\\" + g_ActiveFieldName + L"\\" + baseName + L".dds";
+            if (FileExists(fieldDdsPath)) return fieldDdsPath;
+        }
+    }
+
     for (const auto& modFolder : g_ActiveMods) {
         // 1. Check under /textures/
         std::wstring pngPath = g_BaseDir + L"\\" + g_ModsDirectory + L"\\" + modFolder + L"\\textures\\" + baseName + L".png";
@@ -754,6 +774,116 @@ HRESULT LoadOverrideTexture(ID3D11Device* pDevice, const std::wstring& filePath,
     return E_FAIL;
 }
 
+#include <unordered_set>
+#include <mutex>
+
+std::unordered_set<ID3D11Resource*> g_BackgroundTextures;
+std::recursive_mutex g_BackgroundTexturesMutex;
+
+typedef HRESULT (STDMETHODCALLTYPE *Map_t)(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pResource,
+    UINT Subresource,
+    D3D11_MAP MapType,
+    UINT MapFlags,
+    D3D11_MAPPED_SUBRESOURCE* pMappedResource
+);
+Map_t OriginalMap = nullptr;
+
+typedef void (STDMETHODCALLTYPE *Unmap_t)(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pResource,
+    UINT Subresource
+);
+Unmap_t OriginalUnmap = nullptr;
+
+typedef void (STDMETHODCALLTYPE *UpdateSubresource_t)(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pDstResource,
+    UINT DstSubresource,
+    const D3D11_BOX* pDstBox,
+    const void* pSrcData,
+    UINT SrcRowPitch,
+    UINT SrcDepthPitch
+);
+UpdateSubresource_t OriginalUpdateSubresource = nullptr;
+
+// Thread-local dummy buffer for Map writes
+thread_local std::vector<BYTE> t_DummyBuffer;
+
+HRESULT STDMETHODCALLTYPE HookedMap(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pResource,
+    UINT Subresource,
+    D3D11_MAP MapType,
+    UINT MapFlags,
+    D3D11_MAPPED_SUBRESOURCE* pMappedResource
+) {
+    bool isBackground = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_BackgroundTexturesMutex);
+        if (g_BackgroundTextures.find(pResource) != g_BackgroundTextures.end()) {
+            isBackground = true;
+        }
+    }
+
+    if (isBackground) {
+        if (t_DummyBuffer.size() < 256 * 256 * 4) {
+            t_DummyBuffer.resize(256 * 256 * 4, 0);
+        }
+        pMappedResource->pData = t_DummyBuffer.data();
+        pMappedResource->RowPitch = 256 * 4;
+        pMappedResource->DepthPitch = 256 * 256 * 4;
+        return S_OK;
+    }
+
+    return OriginalMap(This, pResource, Subresource, MapType, MapFlags, pMappedResource);
+}
+
+void STDMETHODCALLTYPE HookedUnmap(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pResource,
+    UINT Subresource
+) {
+    bool isBackground = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_BackgroundTexturesMutex);
+        if (g_BackgroundTextures.find(pResource) != g_BackgroundTextures.end()) {
+            isBackground = true;
+        }
+    }
+
+    if (isBackground) {
+        return;
+    }
+
+    OriginalUnmap(This, pResource, Subresource);
+}
+
+void STDMETHODCALLTYPE HookedUpdateSubresource(
+    ID3D11DeviceContext* This,
+    ID3D11Resource* pDstResource,
+    UINT DstSubresource,
+    const D3D11_BOX* pDstBox,
+    const void* pSrcData,
+    UINT SrcRowPitch,
+    UINT SrcDepthPitch
+) {
+    bool isBackground = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_BackgroundTexturesMutex);
+        if (g_BackgroundTextures.find(pDstResource) != g_BackgroundTextures.end()) {
+            isBackground = true;
+        }
+    }
+
+    if (isBackground) {
+        return;
+    }
+
+    OriginalUpdateSubresource(This, pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
+}
+
 HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
     ID3D11Device* This,
     const D3D11_TEXTURE2D_DESC* pDesc,
@@ -774,6 +904,11 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 assetName = g_LastLoadedTexFile;
                 g_LastLoadedTexFile = L""; // Clear character texture tracking!
             }
+        } else if (!g_ActiveFieldName.empty() && pDesc->Usage == 2 && pDesc->BindFlags == 8 && pDesc->Width == 256 && pDesc->Height == 256) {
+            wchar_t fieldTexName[64];
+            swprintf_s(fieldTexName, L"%s_%02d_00", g_ActiveFieldName.c_str(), g_FieldTextureCounter);
+            assetName = fieldTexName;
+            g_FieldTextureCounter++;
         } else if (!g_ActiveStageName.empty() && g_MaxStageTextures > 0) {
             if (pDesc->Usage == 2 && pDesc->BindFlags == 8 && g_StageTextureCounter < g_MaxStageTextures) {
                 wchar_t stageTexName[64];
@@ -812,6 +947,19 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                     Log("[Loader] Swapped static texture %S in CreateTexture2D: Override=%p\n", assetName.c_str(), pOverrideTex);
                 } else {
                     Log("[Loader] ERROR: LoadOverrideTexture failed for path %S: 0x%08X\n", overridePath.c_str(), hrLoad);
+                }
+            } else if (pDesc->Usage == 2) {
+                ID3D11Texture2D* pOverrideTex = nullptr;
+                HRESULT hrLoad = LoadOverrideTexture(This, overridePath, pDesc->BindFlags, &pOverrideTex);
+                if (SUCCEEDED(hrLoad) && pOverrideTex) {
+                    (*ppTexture2D)->Release();
+                    *ppTexture2D = pOverrideTex;
+                    Log("[Loader] Swapped dynamic background texture %S in CreateTexture2D: Override=%p\n", assetName.c_str(), pOverrideTex);
+
+                    std::lock_guard<std::recursive_mutex> lock(g_BackgroundTexturesMutex);
+                    g_BackgroundTextures.insert(pOverrideTex);
+                } else {
+                    Log("[Loader] ERROR: LoadOverrideTexture failed for dynamic background %S: 0x%08X\n", overridePath.c_str(), hrLoad);
                 }
             }
         }
@@ -856,6 +1004,16 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
                 Log("[Loader] Hooking ID3D11Device::CreateTexture2D via VMT...\n");
                 OriginalCreateTexture2D = (CreateTexture2D_t)HookVMT(pDevice, 5, HookedCreateTexture2D);
                 Log("[Loader] ID3D11Device::CreateTexture2D Hooked via VMT! Original: %p\n", OriginalCreateTexture2D);
+            }
+        }
+        if (ppImmediateContext && *ppImmediateContext) {
+            ID3D11DeviceContext* pContext = *ppImmediateContext;
+            if (!OriginalMap) {
+                Log("[Loader] Hooking ID3D11DeviceContext::Map via VMT...\n");
+                OriginalMap = (Map_t)HookVMT(pContext, 14, HookedMap);
+                OriginalUnmap = (Unmap_t)HookVMT(pContext, 15, HookedUnmap);
+                OriginalUpdateSubresource = (UpdateSubresource_t)HookVMT(pContext, 48, HookedUpdateSubresource);
+                Log("[Loader] ID3D11DeviceContext Map/Unmap/UpdateSubresource Hooked via VMT!\n");
             }
         }
         if (ppSwapChain && *ppSwapChain) {
@@ -2324,6 +2482,14 @@ DWORD WINAPI HookedGetFileAttributesW(LPCWSTR lpFileName) {
             std::wstring originalPath = pathStr;
             std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
 
+            if (pathStr.find(L"layout_pc") != std::wstring::npos ||
+                pathStr.find(L"flevel") != std::wstring::npos ||
+                pathStr.find(L"field") != std::wstring::npos ||
+                pathStr.find(L".png") != std::wstring::npos ||
+                pathStr.find(L".dds") != std::wstring::npos) {
+                Log("[Loader] GetFileAttributesW called for assets: %S\n", lpFileName);
+            }
+
             size_t dataPos = pathStr.find(L"\\data\\");
             if (dataPos != std::wstring::npos) {
                 size_t prefixLen = 6;
@@ -2474,6 +2640,14 @@ HANDLE WINAPI HookedCreateFileW(
             std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
             std::wstring originalPath = pathStr;
             std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::towlower);
+
+            if (pathStr.find(L"layout_pc") != std::wstring::npos ||
+                pathStr.find(L"flevel") != std::wstring::npos ||
+                pathStr.find(L"field") != std::wstring::npos ||
+                pathStr.find(L".png") != std::wstring::npos ||
+                pathStr.find(L".dds") != std::wstring::npos) {
+                Log("[Loader] CreateFileW called for assets: %S\n", lpFileName);
+            }
 
             size_t dataPos = pathStr.find(L"\\data\\");
             if (dataPos != std::wstring::npos) {
@@ -2707,6 +2881,17 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
                 }
             }
         } else {
+            if (archivePathLower.find(L"flevel.lgp") != std::wstring::npos) {
+                size_t dotPos = entryNameLower.find(L".");
+                if (dotPos != std::wstring::npos) {
+                    std::wstring fieldName = entryNameLower.substr(0, dotPos);
+                    if (fieldName != g_ActiveFieldName) {
+                        g_ActiveFieldName = fieldName;
+                        g_FieldTextureCounter = 0;
+                        Log("[Loader] Active field map set to: %S\n", g_ActiveFieldName.c_str());
+                    }
+                }
+            }
             if (entryNameLower.find(L".tex") != std::wstring::npos) {
                 g_LastLoadedTexFile = entryNameLower;
             }
