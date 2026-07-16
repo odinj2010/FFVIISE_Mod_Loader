@@ -904,7 +904,7 @@ HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 assetName = g_LastLoadedTexFile;
                 g_LastLoadedTexFile = L""; // Clear character texture tracking!
             }
-        } else if (!g_ActiveFieldName.empty() && pDesc->Usage == 2 && pDesc->BindFlags == 8 && pDesc->Width == 256 && pDesc->Height == 256) {
+        } else if (!g_ActiveFieldName.empty() && g_FieldTextureCounter < 4 && pDesc->Usage == 2 && pDesc->BindFlags == 8 && pDesc->Width == 256 && pDesc->Height == 256) {
             wchar_t fieldTexName[64];
             swprintf_s(fieldTexName, L"%s_%02d_00", g_ActiveFieldName.c_str(), g_FieldTextureCounter);
             assetName = fieldTexName;
@@ -2851,6 +2851,7 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
                         bool isMasterFile = (entry.name.length() >= 4 && entry.name.substr(entry.name.length() - 2) == "aa");
                         if (stageName != g_ActiveStageName || isMasterFile) {
                             g_ActiveStageName = stageName;
+                            g_ActiveFieldName = L""; // Clear active field map!
                             g_StageTextureCounter = 0;
                             g_CurrentStageTexName = L"";
                             g_LastLoadedTexFile = L""; // Clear character texture tracking
@@ -2887,6 +2888,7 @@ void UpdateRedirection(FILE* stream, RedirectState& state, DWORD targetOffset) {
                     std::wstring fieldName = entryNameLower.substr(0, dotPos);
                     if (fieldName != g_ActiveFieldName) {
                         g_ActiveFieldName = fieldName;
+                        g_ActiveStageName = L""; // Clear active battle stage!
                         g_FieldTextureCounter = 0;
                         Log("[Loader] Active field map set to: %S\n", g_ActiveFieldName.c_str());
                     }
