@@ -9,6 +9,7 @@ void* g_OriginalInBattlePtr = nullptr;
 void* g_OriginalEnemyNoATB = nullptr;
 bool g_InBattleActive = false;
 DWORD g_LastUpdateTick = 0;
+extern char g_LogPath[MAX_PATH];
 
 // Log function to output to debugger, console, and log file
 void DebugLog(const char* format, ...) {
@@ -19,9 +20,9 @@ void DebugLog(const char* format, ...) {
     va_end(args);
     OutputDebugStringA(buf);
 
-    if (g_EnableLogging) {
+    if (g_EnableLogging && g_LogPath[0] != '\0') {
         FILE* f = nullptr;
-        fopen_s(&f, "plugins\\battle_overlay_log.txt", "a");
+        fopen_s(&f, g_LogPath, "a");
         if (f) {
             fprintf(f, "%s", buf);
             fclose(f);

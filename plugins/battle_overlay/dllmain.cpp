@@ -10,6 +10,8 @@ HMODULE g_hModule = NULL;
 bool g_EnableLogging = false;
 int g_Opacity = 102;
 char g_IniPath[MAX_PATH] = { 0 };
+char g_LogPath[MAX_PATH] = { 0 };
+char g_LogFile[MAX_PATH] = "battle_overlay_log.txt";
 
 // Definitions of configuration variables
 bool g_ShowParty = true;
@@ -96,6 +98,20 @@ void LoadConfig() {
     GetPrivateProfileStringA("Config", "EnableLogging", "false", temp, sizeof(temp), g_IniPath);
     g_EnableLogging = ParseBool(temp, false);
 
+    // Read LogFile (string)
+    GetPrivateProfileStringA("Config", "LogFile", "battle_overlay_log.txt", g_LogFile, sizeof(g_LogFile), g_IniPath);
+
+    // Resolve full log path in plugins folder
+    char logDir[MAX_PATH] = { 0 };
+    strcpy_s(logDir, sizeof(logDir), g_IniPath);
+    char* lastSlash = strrchr(logDir, '\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = '\0';
+        sprintf_s(g_LogPath, sizeof(g_LogPath), "%s%s", logDir, g_LogFile);
+    } else {
+        sprintf_s(g_LogPath, sizeof(g_LogPath), "plugins\\%s", g_LogFile);
+    }
+
     g_Opacity = GetPrivateProfileIntA("Config", "Opacity", 102, g_IniPath);
     if (g_Opacity < 0) g_Opacity = 0;
     if (g_Opacity > 255) g_Opacity = 255;
@@ -169,9 +185,9 @@ DWORD WINAPI PluginInitThread(LPVOID lpParam) {
     LoadConfig();
 
     // Clear log file at start if logging is enabled
-    if (g_EnableLogging) {
+    if (g_EnableLogging && g_LogPath[0] != '\0') {
         FILE* f = nullptr;
-        fopen_s(&f, "plugins\\battle_overlay_log.txt", "w");
+        fopen_s(&f, g_LogPath, "w");
         if (f) fclose(f);
     }
 
