@@ -30,6 +30,8 @@ A major upgrade focused on asset conflict resolution, load order customization, 
 * **Session Logging:** The log file (`mods_loader_log.txt`) is now truncated/cleared on every fresh game startup. It will no longer grow indefinitely, keeping logs clean and relevant for your current session.
 
 ### 🛠️ Interactive Developer Tool (`run.bat`)
-* **Dual-Option Menu:** Refactored the helper script into an interactive menu. Launching it now prompts you to choose between:
-  1. Compiling the mod loader `d3d11.dll` (includes embedding assets compiled via `rc.exe` and `resources.res`).
-  2. Pushing all changes directly to GitHub, prompting the user to choose the target branch (`main` or `nightly`) and handling checkout switching and remote updates automatically.
+* **Four-Option Interactive CLI Menu:** Refactored the developer helper script into a multi-level menu interface:
+  1. **Compile Components:** Launches a sub-menu allowing you to choose between compiling the Mod Loader (`d3d11.dll`), compiling the Battle Overlay Plugin (`battle_overlay.dll`), or compiling both.
+  2. **Switch Git Branch:** Allows switching between local `main` and `nightly` branches quickly.
+  3. **Push Changes to GitHub:** Prompts for a target branch (`main` or `nightly`), auto-switches checkout branch if needed, and pushes changes to the chosen remote.
+  4. **Exit:** Safely exits the command line tool.

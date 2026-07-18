@@ -1683,6 +1683,7 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
             HookContextMethod(pContext, 21, HookedDrawInstanced, (void**)&OriginalDrawInstanced);
             HookContextMethod(pContext, 33, HookedOMSetRenderTargets, (void**)&OriginalOMSetRenderTargets);
             HookContextMethod(pContext, 34, HookedOMSetRenderTargetsAndUnorderedAccessViews, (void**)&OriginalOMSetRenderTargetsAndUnorderedAccessViews);
+            g_D3D11HookInitialized = true;
             Log("[Loader] ID3D11DeviceContext hooks initialized via detours!\n");
         }
         if (ppSwapChain && *ppSwapChain) {
