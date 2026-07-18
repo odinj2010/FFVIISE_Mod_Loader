@@ -100,9 +100,37 @@ echo ======================================================
 echo               Push changes to GitHub
 echo ======================================================
 echo.
+echo  [1] main branch
+echo  [2] nightly branch
+echo.
+set /p branch_choice="Select which branch to update (1-2): "
+set "target_branch="
+if "%branch_choice%"=="1" set "target_branch=main"
+if "%branch_choice%"=="2" set "target_branch=nightly"
+if "%target_branch%"=="" (
+    echo [ERROR] Invalid branch choice.
+    pause
+    goto :git_push
+)
+
+:: Get current branch name
+for /f "tokens=*" %%i in ('git rev-parse --abbrev-ref HEAD') do set "current_branch=%%i"
+
+:: Ask for commit message
 set "commit_msg="
 set /p commit_msg="Enter commit message (or press Enter for default 'Update mod loader'): "
 if "%commit_msg%"=="" set commit_msg=Update mod loader
+
+:: If current branch is different from target branch, checkout target branch
+if /i not "%current_branch%"=="%target_branch%" (
+    echo [INFO] Switching from %current_branch% to %target_branch%...
+    call git checkout %target_branch%
+    if %ERRORLEVEL% neq 0 (
+        echo [ERROR] Failed to switch to branch %target_branch%.
+        pause
+        exit /b 1
+    )
+)
 
 echo.
 echo [INFO] Running 'git add .'
@@ -121,10 +149,10 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo [INFO] Running 'git push'
-call git push
+echo [INFO] Running 'git push origin %target_branch%'
+call git push origin %target_branch%
 if %ERRORLEVEL% equ 0 (
-    echo [SUCCESS] Successfully pushed changes to GitHub!
+    echo [SUCCESS] Successfully pushed changes to origin/%target_branch%!
 ) else (
     echo [ERROR] git push failed.
 )

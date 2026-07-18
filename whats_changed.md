@@ -32,4 +32,4 @@ A major upgrade focused on asset conflict resolution, load order customization, 
 ### 🛠️ Interactive Developer Tool (`run.bat`)
 * **Dual-Option Menu:** Refactored the helper script into an interactive menu. Launching it now prompts you to choose between:
   1. Compiling the mod loader `d3d11.dll` (includes embedding assets compiled via `rc.exe` and `resources.res`).
-  2. Pushing all changes directly to GitHub with a custom or default commit message.
+  2. Pushing all changes directly to GitHub, prompting the user to choose the target branch (`main` or `nightly`) and handling checkout switching and remote updates automatically.
