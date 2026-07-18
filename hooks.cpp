@@ -181,6 +181,10 @@ HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
 bool g_D3D11HookInitialized = false;
 ULONGLONG g_StartTickCount = 0;
 bool g_OverlayEnabled = true;
+bool g_ShowConsole = false;
+bool g_EnablePlugins = true;
+bool g_EnableMods = true;
+int g_OverlayDisplayTime = 5000;
 thread_local std::wstring g_LastLoadedTexFile = L"";
 thread_local bool t_InHookCreateTexture2D = false;
 std::wstring g_ActiveStageName = L"";
@@ -417,7 +421,7 @@ DWORD WINAPI OverlayThread(LPVOID lpParam) {
 
     ULONGLONG start = GetTickCount64();
     MSG msg;
-    while (GetTickCount64() - start < 5000) {
+    while (GetTickCount64() - start < (ULONGLONG)g_OverlayDisplayTime) {
         // Handle window positioning
         if (IsWindow(hGameWnd)) {
             RECT gameRect;
@@ -1785,18 +1789,27 @@ std::vector<FileInfo> GetFilesInDirectory(const std::wstring& dirPath) {
 
 // Logging Helper
 void Log(const char* format, ...) {
-    if (!g_EnableLogging) return;
+    if (!g_EnableLogging && !g_ShowConsole) return;
     static std::mutex logMutex;
     std::lock_guard<std::mutex> lock(logMutex);
     
-    FILE* f = NULL;
-    _wfopen_s(&f, g_LogPath.c_str(), L"a");
-    if (f) {
-        va_list args;
+    va_list args;
+    
+    if (g_EnableLogging) {
+        FILE* f = NULL;
+        _wfopen_s(&f, g_LogPath.c_str(), L"a");
+        if (f) {
+            va_start(args, format);
+            vfprintf(f, format, args);
+            va_end(args);
+            fclose(f);
+        }
+    }
+    
+    if (g_ShowConsole) {
         va_start(args, format);
-        vfprintf(f, format, args);
+        vprintf(format, args);
         va_end(args);
-        fclose(f);
     }
 }
 
@@ -2208,6 +2221,45 @@ void PreInitializeLogging() {
     std::transform(logStrLower.begin(), logStrLower.end(), logStrLower.begin(), ::towlower);
     g_EnableLogging = (logStrLower == L"true");
 
+    // Read ShowConsole (true/false)
+    wchar_t showConsoleStr[32] = L"false";
+    GetPrivateProfileStringW(L"Loader", L"ShowConsole", L"false", showConsoleStr, 32, iniPath.c_str());
+    std::wstring showConsoleLower = showConsoleStr;
+    std::transform(showConsoleLower.begin(), showConsoleLower.end(), showConsoleLower.begin(), ::towlower);
+    g_ShowConsole = (showConsoleLower == L"true");
+
+    // Read EnablePlugins (true/false)
+    wchar_t enablePluginsStr[32] = L"true";
+    GetPrivateProfileStringW(L"Loader", L"EnablePlugins", L"true", enablePluginsStr, 32, iniPath.c_str());
+    std::wstring enablePluginsLower = enablePluginsStr;
+    std::transform(enablePluginsLower.begin(), enablePluginsLower.end(), enablePluginsLower.begin(), ::towlower);
+    g_EnablePlugins = (enablePluginsLower == L"true");
+
+    // Read EnableMods (true/false)
+    wchar_t enableModsStr[32] = L"true";
+    GetPrivateProfileStringW(L"Loader", L"EnableMods", L"true", enableModsStr, 32, iniPath.c_str());
+    std::wstring enableModsLower = enableModsStr;
+    std::transform(enableModsLower.begin(), enableModsLower.end(), enableModsLower.begin(), ::towlower);
+    g_EnableMods = (enableModsLower == L"true");
+
+    // Read OverlayDisplayTime (milliseconds, default 5000)
+    g_OverlayDisplayTime = GetPrivateProfileIntW(L"Loader", L"OverlayDisplayTime", 5000, iniPath.c_str());
+    if (g_OverlayDisplayTime <= 0) {
+        g_OverlayEnabled = false;
+    }
+
+    // Allocate Console if requested
+    if (g_ShowConsole) {
+        AllocConsole();
+        FILE* fp = nullptr;
+        freopen_s(&fp, "CONOUT$", "w", stdout);
+        freopen_s(&fp, "CONOUT$", "w", stderr);
+        freopen_s(&fp, "CONIN$", "r", stdin);
+        SetConsoleTitleW(L"FFVII Mod Loader Console");
+        // Clear standard C++ stream sync to avoid overhead/buffering
+        std::ios::sync_with_stdio(false);
+    }
+
     // Read ModsDirectory
     wchar_t modsDir[MAX_PATH] = L"mods";
     GetPrivateProfileStringW(L"Loader", L"ModsDirectory", L"mods", modsDir, MAX_PATH, iniPath.c_str());
@@ -2262,6 +2314,10 @@ void PreInitializeLogging() {
         }
     }
 
+    if (g_ShowConsole) {
+        printf("[Loader] === Console Initialized ===\n");
+    }
+
     if (g_EnableTextureLogging) {
         FILE* fTex = NULL;
         _wfopen_s(&fTex, g_TextureLogPath.c_str(), L"w");
@@ -2277,6 +2333,10 @@ void LoadConfiguration() {
 
 void LoadModsLoadOrder() {
     g_ActiveMods.clear();
+    if (!g_EnableMods) {
+        Log("[Loader] Mods loading is disabled in mods_loader.ini.\n");
+        return;
+    }
     std::wstring modsPath = g_BaseDir + L"\\" + g_ModsDirectory;
     if (!DirectoryExists(modsPath)) {
         Log("[Loader] Mods directory does not exist: %S\n", modsPath.c_str());
@@ -2484,6 +2544,10 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* exceptionInfo) {
 
 void LoadPlugins() {
     g_ActivePlugins.clear();
+    if (!g_EnablePlugins) {
+        Log("[Plugins] Plugins loading is disabled in mods_loader.ini.\n");
+        return;
+    }
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     std::wstring exeStr = exePath;

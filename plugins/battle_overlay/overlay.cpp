@@ -89,108 +89,131 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             DeleteObject(bgBrush);
 
             if (IsInBattle()) {
-                // Draw a nice semi-transparent black panel on the top left
-                HBRUSH panelBrush = CreateSolidBrush(RGB(15, 15, 20));
-                RECT panelRect = { 10, 10, 520, 420 };
+                // Draw a nice semi-transparent black panel
+                HBRUSH panelBrush = CreateSolidBrush(g_PanelBgColor);
+                RECT panelRect = { g_PanelX, g_PanelY, g_PanelX + g_PanelWidth, g_PanelY + g_PanelHeight };
                 FillRect(hdcMem, &panelRect, panelBrush);
                 DeleteObject(panelBrush);
 
                 // Panel border
-                HPEN panelPen = CreatePen(PS_SOLID, 2, RGB(0, 122, 204));
+                HPEN panelPen = CreatePen(PS_SOLID, 2, g_PanelBorderColor);
                 HPEN oldPen = (HPEN)SelectObject(hdcMem, panelPen);
                 HBRUSH oldBrush = (HBRUSH)SelectObject(hdcMem, GetStockObject(NULL_BRUSH));
-                Rectangle(hdcMem, 10, 10, 520, 420);
+                Rectangle(hdcMem, g_PanelX, g_PanelY, g_PanelX + g_PanelWidth, g_PanelY + g_PanelHeight);
                 SelectObject(hdcMem, oldPen);
                 SelectObject(hdcMem, oldBrush);
                 DeleteObject(panelPen);
 
                 // Set up fonts and text drawing parameters
-                HFONT hFontTitle = CreateFontA(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Consolas");
-                HFONT hFontText = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Consolas");
+                HFONT hFontTitle = CreateFontA(g_TitleFontSize, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, g_FontFace);
+                HFONT hFontText = CreateFontA(g_TextFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, g_FontFace);
                 
                 SetBkMode(hdcMem, TRANSPARENT);
 
                 // Draw Title
                 SelectObject(hdcMem, hFontTitle);
-                SetTextColor(hdcMem, RGB(0, 192, 255));
-                TextOutA(hdcMem, 25, 20, "FFVII BATTLE ANALYZER", 21);
+                SetTextColor(hdcMem, g_TitleColor);
+                TextOutA(hdcMem, g_PanelX + 15, g_PanelY + 10, "FFVII BATTLE ANALYZER", 21);
 
                 SelectObject(hdcMem, hFontText);
 
-                int yOffset = 55;
+                int yOffset = g_PanelY + g_TitleFontSize + 25;
 
                 // 1. Draw Playable Characters (Indices 0 - 2)
-                SetTextColor(hdcMem, RGB(255, 255, 255));
-                TextOutA(hdcMem, 25, yOffset, "--- ALLIES ---", 14);
-                yOffset += 20;
+                if (g_ShowParty) {
+                    SetTextColor(hdcMem, g_TextColorHeader);
+                    TextOutA(hdcMem, g_PanelX + 15, yOffset, "--- ALLIES ---", 14);
+                    yOffset += g_TextFontSize + 4;
 
-                for (int i = 0; i < 3; i++) {
-                    ActorData data;
-                    if (GetActorData(i, data) && data.is_active) {
-                        char buf[128];
-                        snprintf(buf, sizeof(buf), "Ally %d: HP %d/%d | MP %d/%d", i + 1, data.current_hp, data.max_hp, data.current_mp, data.max_mp);
-                        SetTextColor(hdcMem, RGB(230, 230, 230));
-                        TextOutA(hdcMem, 25, yOffset, buf, (int)strlen(buf));
-                        
-                        // HP progress bar
-                        float hpPercent = data.max_hp > 0 ? (float)data.current_hp / data.max_hp : 0.0f;
-                        DrawProgressBar(hdcMem, 25, yOffset + 18, 200, 8, hpPercent, RGB(0, 200, 80));
+                    for (int i = 0; i < 3; i++) {
+                        ActorData data;
+                        if (GetActorData(i, data) && data.is_active) {
+                            char buf[128];
+                            snprintf(buf, sizeof(buf), "Ally %d: HP %d/%d | MP %d/%d", i + 1, data.current_hp, data.max_hp, data.current_mp, data.max_mp);
+                            SetTextColor(hdcMem, g_TextColorAlly);
+                            TextOutA(hdcMem, g_PanelX + 15, yOffset, buf, (int)strlen(buf));
+                            
+                            // HP progress bar
+                            float hpPercent = data.max_hp > 0 ? (float)data.current_hp / data.max_hp : 0.0f;
+                            DrawProgressBar(hdcMem, g_PanelX + 15, yOffset + g_TextFontSize + 2, 200, 8, hpPercent, g_PlayerHPColor);
 
-                        // ATB progress bar (max ATB value is usually 65535)
-                        float atbPercent = (float)data.atb / 65535.0f;
-                        DrawProgressBar(hdcMem, 240, yOffset + 18, 200, 8, atbPercent, RGB(255, 140, 0));
+                            // ATB progress bar (max ATB value is usually 65535)
+                            if (g_ShowATB) {
+                                float atbPercent = (float)data.atb / 65535.0f;
+                                DrawProgressBar(hdcMem, g_PanelX + 230, yOffset + g_TextFontSize + 2, 200, 8, atbPercent, g_ATBColor);
+                            }
 
-                        yOffset += 32;
+                            // Numeric HP overlay if enabled
+                            if (g_ShowNumericHP) {
+                                char hpBuf[32];
+                                snprintf(hpBuf, sizeof(hpBuf), "%d/%d", data.current_hp, data.max_hp);
+                                SetTextColor(hdcMem, g_TextColorAlly);
+                                TextOutA(hdcMem, g_PanelX + 15 + 205, yOffset + g_TextFontSize - 2, hpBuf, (int)strlen(hpBuf));
+                            }
+
+                            yOffset += g_TextFontSize + 16;
+                        }
                     }
+                    yOffset += 10;
                 }
-
-                yOffset += 10;
 
                 // 2. Draw Enemies (Indices 4 - 9)
-                SetTextColor(hdcMem, RGB(255, 255, 255));
-                TextOutA(hdcMem, 25, yOffset, "--- ENEMIES ---", 15);
-                yOffset += 20;
+                if (g_ShowEnemies) {
+                    SetTextColor(hdcMem, g_TextColorHeader);
+                    TextOutA(hdcMem, g_PanelX + 15, yOffset, "--- ENEMIES ---", 15);
+                    yOffset += g_TextFontSize + 4;
 
-                int enemyCount = 0;
-                for (int i = 4; i < 10; i++) {
-                    ActorData data;
-                    if (GetActorData(i, data) && data.is_active) {
-                        enemyCount++;
-                        char buf[128];
-                        snprintf(buf, sizeof(buf), "Enemy %d: HP %d/%d | MP %d/%d", enemyCount, data.current_hp, data.max_hp, data.current_mp, data.max_mp);
-                        SetTextColor(hdcMem, RGB(255, 80, 80));
-                        TextOutA(hdcMem, 25, yOffset, buf, (int)strlen(buf));
+                    int enemyCount = 0;
+                    for (int i = 4; i < 10; i++) {
+                        ActorData data;
+                        if (GetActorData(i, data) && data.is_active) {
+                            enemyCount++;
+                            char buf[128];
+                            snprintf(buf, sizeof(buf), "Enemy %d: HP %d/%d | MP %d/%d", enemyCount, data.current_hp, data.max_hp, data.current_mp, data.max_mp);
+                            SetTextColor(hdcMem, g_TextColorEnemy);
+                            TextOutA(hdcMem, g_PanelX + 15, yOffset, buf, (int)strlen(buf));
 
-                        // HP progress bar
-                        float hpPercent = data.max_hp > 0 ? (float)data.current_hp / data.max_hp : 0.0f;
-                        DrawProgressBar(hdcMem, 25, yOffset + 18, 180, 8, hpPercent, RGB(220, 40, 40));
+                            // HP progress bar
+                            float hpPercent = data.max_hp > 0 ? (float)data.current_hp / data.max_hp : 0.0f;
+                            DrawProgressBar(hdcMem, g_PanelX + 15, yOffset + g_TextFontSize + 2, 180, 8, hpPercent, g_EnemyHPColor);
 
-                        // ATB progress bar
-                        float atbPercent = (float)data.atb / 65535.0f;
-                        DrawProgressBar(hdcMem, 220, yOffset + 18, 100, 8, atbPercent, RGB(255, 140, 0));
+                            // ATB progress bar
+                            if (g_ShowATB) {
+                                float atbPercent = (float)data.atb / 65535.0f;
+                                DrawProgressBar(hdcMem, g_PanelX + 210, yOffset + g_TextFontSize + 2, 100, 8, atbPercent, g_ATBColor);
+                            }
 
-                        // Steal Status
-                        if (data.stolen) {
-                            SetTextColor(hdcMem, RGB(120, 120, 120));
-                            TextOutA(hdcMem, 335, yOffset + 14, "[Stolen]", 8);
-                        } else {
-                            SetTextColor(hdcMem, RGB(0, 255, 120));
-                            TextOutA(hdcMem, 335, yOffset + 14, "[Can Steal]", 11);
+                            // Numeric HP overlay if enabled
+                            if (g_ShowNumericHP) {
+                                char hpBuf[32];
+                                snprintf(hpBuf, sizeof(hpBuf), "%d/%d", data.current_hp, data.max_hp);
+                                SetTextColor(hdcMem, g_TextColorEnemy);
+                                TextOutA(hdcMem, g_PanelX + 15 + 185, yOffset + g_TextFontSize - 2, hpBuf, (int)strlen(hpBuf));
+                            }
+
+                            // Steal Status
+                            if (data.stolen) {
+                                SetTextColor(hdcMem, RGB(120, 120, 120));
+                                TextOutA(hdcMem, g_PanelX + 325, yOffset + g_TextFontSize - 2, "[Stolen]", 8);
+                            } else {
+                                SetTextColor(hdcMem, RGB(0, 255, 120));
+                                TextOutA(hdcMem, g_PanelX + 325, yOffset + g_TextFontSize - 2, "[Can Steal]", 11);
+                            }
+
+                            // Sensed indicator
+                            if (data.sensed) {
+                                SetTextColor(hdcMem, RGB(180, 180, 0));
+                                TextOutA(hdcMem, g_PanelX + 435, yOffset + g_TextFontSize - 2, "[Sensed]", 8);
+                            }
+
+                            yOffset += g_TextFontSize + 16;
                         }
-
-                        // Sensed indicator
-                        if (data.sensed) {
-                            SetTextColor(hdcMem, RGB(180, 180, 0));
-                            TextOutA(hdcMem, 435, yOffset + 14, "[Sensed]", 8);
-                        }
-
-                        yOffset += 32;
                     }
-                }
 
-                if (enemyCount == 0) {
-                    SetTextColor(hdcMem, RGB(150, 150, 150));
-                    TextOutA(hdcMem, 25, yOffset, "(Scanning for active enemies...)", 32);
+                    if (enemyCount == 0) {
+                        SetTextColor(hdcMem, RGB(150, 150, 150));
+                        TextOutA(hdcMem, g_PanelX + 15, yOffset, "(Scanning for active enemies...)", 32);
+                    }
                 }
 
                 DeleteObject(hFontTitle);

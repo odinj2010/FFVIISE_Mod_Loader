@@ -3,6 +3,7 @@
 ## [v3.0.0-alpha] (Current Development)
 ### Added
 - **Direct3D 11 Texture Interception**: Hooked the virtual method table (VMT) of `ID3D11Device` at index `5` to intercept `CreateTexture2D` calls.
+- **Configuration & Style Customizations**: Added a complete suite of customization options to `mods_loader.ini` and `battle_overlay.ini` (updated to use modern `true`/`false` booleans for all settings, with legacy fallback support). Users can now toggle console windows, toggle plugin/mod loaders globally, adjust banner display timers, reposition and resize the battle overlay, change fonts (face and size), adjust colors (hex/RGB formats), and toggle individual stats visibility (party, enemies, ATB, numeric HP).
 - **Isolated Texture Logger**: Redirected texture creation parameters (dimensions, formats, mipmap levels, and flags) to a separate log file `d3d11_texture_log.txt` to keep the main loader log clean and prevent performance impact.
 - **Texture Asset Filename Correlation**: Implemented thread-local tracking (`g_LastLoadedTexFile`) across LGP archives and loose file reads to correlate D3D11 runtime texture creations back to their game asset names.
 - **Session-Based Texture Truncation**: Truncates `d3d11_texture_log.txt` at startup so texture logging stays fresh for each gameplay session.
