@@ -216,6 +216,28 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                     }
                 }
 
+                // Draw FPS if enabled
+                if (g_ShowFPS) {
+                    static DWORD lastTime = GetTickCount();
+                    static int frameCount = 0;
+                    static int fps = 60;
+                    
+                    frameCount++;
+                    DWORD currentTime = GetTickCount();
+                    if (currentTime - lastTime >= 1000) {
+                        fps = frameCount;
+                        frameCount = 0;
+                        lastTime = currentTime;
+                    }
+                    
+                    char fpsBuf[32];
+                    snprintf(fpsBuf, sizeof(fpsBuf), "FPS: %d", fps);
+                    SetTextColor(hdcMem, RGB(0, 255, 120));
+                    int fpsX = g_PanelX + g_PanelWidth - 85;
+                    int fpsY = g_PanelY + 10;
+                    TextOutA(hdcMem, fpsX, fpsY, fpsBuf, (int)strlen(fpsBuf));
+                }
+
                 DeleteObject(hFontTitle);
                 DeleteObject(hFontText);
             }

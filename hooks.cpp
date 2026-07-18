@@ -185,6 +185,7 @@ bool g_ShowConsole = false;
 bool g_EnablePlugins = true;
 bool g_EnableMods = true;
 int g_OverlayDisplayTime = 5000;
+bool g_VerboseLogging = false;
 thread_local std::wstring g_LastLoadedTexFile = L"";
 thread_local bool t_InHookCreateTexture2D = false;
 std::wstring g_ActiveStageName = L"";
@@ -2228,6 +2229,13 @@ void PreInitializeLogging() {
     std::transform(showConsoleLower.begin(), showConsoleLower.end(), showConsoleLower.begin(), ::towlower);
     g_ShowConsole = (showConsoleLower == L"true");
 
+    // Read VerboseLogging (true/false)
+    wchar_t verboseStr[32] = L"false";
+    GetPrivateProfileStringW(L"Loader", L"VerboseLogging", L"false", verboseStr, 32, iniPath.c_str());
+    std::wstring verboseLower = verboseStr;
+    std::transform(verboseLower.begin(), verboseLower.end(), verboseLower.begin(), ::towlower);
+    g_VerboseLogging = (verboseLower == L"true");
+
     // Read EnablePlugins (true/false)
     wchar_t enablePluginsStr[32] = L"true";
     GetPrivateProfileStringW(L"Loader", L"EnablePlugins", L"true", enablePluginsStr, 32, iniPath.c_str());
@@ -3089,7 +3097,9 @@ FILE* HookedWfopen(const wchar_t* filename, const wchar_t* mode) {
         }
     }
 
-    Log("[Loader] _wfopen called: %S (mode: %S)\n", filename ? filename : L"NULL", mode ? mode : L"NULL");
+    if (g_VerboseLogging) {
+        Log("[Loader] _wfopen called: %S (mode: %S)\n", filename ? filename : L"NULL", mode ? mode : L"NULL");
+    }
     FILE* f = OriginalWfopen(filename, mode);
     if (filename) {
         std::wstring pathStr = filename;
