@@ -309,7 +309,7 @@ bool GetActorData(int index, ActorData& outData) {
         if (index < 3) {
             outData.is_active = (outData.max_hp > 0 && actor_id <= 8);
         } else {
-            outData.is_active = (outData.max_hp > 0);
+            outData.is_active = (outData.max_hp > 0 && outData.current_hp > 0);
         }
 
         return true;
