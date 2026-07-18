@@ -10,6 +10,21 @@ bool g_OverlayRunning = false;
 HWND g_hGameWnd = nullptr;
 bool g_ShowOverlay = true;
 
+// Diagnostics functions from Loader (d3d11.dll)
+typedef int(*GetActiveModsCount_t)();
+typedef void(*GetActiveModName_t)(int, wchar_t*, int);
+typedef int(*GetActivePluginsCount_t)();
+typedef void(*GetActivePluginInfo_t)(int, wchar_t*, void**);
+typedef void(*GetLoaderDiagnosticInfo_t)(int*, int*, int*);
+
+GetActiveModsCount_t fnGetActiveModsCount = nullptr;
+GetActiveModName_t fnGetActiveModName = nullptr;
+GetActivePluginsCount_t fnGetActivePluginsCount = nullptr;
+GetActivePluginInfo_t fnGetActivePluginInfo = nullptr;
+GetLoaderDiagnosticInfo_t fnGetLoaderDiagnosticInfo = nullptr;
+
+bool g_DevPanelVisible = false;
+
 
 // Forward declaration of WndProc
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -238,6 +253,119 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                     TextOutA(hdcMem, fpsX, fpsY, fpsBuf, (int)strlen(fpsBuf));
                 }
 
+                // Draw Developer Diagnostics Panel if enabled and toggled visible
+                if (g_ShowDeveloperPanel && g_DevPanelVisible) {
+                    int devX = g_PanelX + g_PanelWidth + 10;
+                    int devY = g_PanelY;
+                    int devWidth = 400;
+                    int devHeight = g_PanelHeight;
+
+                    // Panel background (dark charcoal)
+                    HBRUSH devBgBrush = CreateSolidBrush(RGB(20, 20, 25));
+                    RECT devRect = { devX, devY, devX + devWidth, devY + devHeight };
+                    FillRect(hdcMem, &devRect, devBgBrush);
+                    DeleteObject(devBgBrush);
+
+                    // Panel border (warm developer orange)
+                    HPEN devPen = CreatePen(PS_SOLID, 2, RGB(220, 100, 50));
+                    HPEN oldPen = (HPEN)SelectObject(hdcMem, devPen);
+                    HBRUSH oldBrush = (HBRUSH)SelectObject(hdcMem, GetStockObject(NULL_BRUSH));
+                    Rectangle(hdcMem, devX, devY, devX + devWidth, devY + devHeight);
+                    SelectObject(hdcMem, oldPen);
+                    SelectObject(hdcMem, oldBrush);
+                    DeleteObject(devPen);
+
+                    // Title
+                    SelectObject(hdcMem, hFontTitle);
+                    SetTextColor(hdcMem, RGB(255, 120, 50));
+                    TextOutA(hdcMem, devX + 15, devY + 10, "DEVELOPER DIAGNOSTICS", 21);
+
+                    SelectObject(hdcMem, hFontText);
+                    int devYOffset = devY + g_TitleFontSize + 25;
+
+                    // Read Loader diagnostics if available
+                    int d3dHooked = 0, loggingEnabled = 0, verboseLogging = 0;
+                    if (fnGetLoaderDiagnosticInfo) {
+                        fnGetLoaderDiagnosticInfo(&d3dHooked, &loggingEnabled, &verboseLogging);
+                    }
+
+                    char stateBuf[128];
+                    snprintf(stateBuf, sizeof(stateBuf), "Loader Status: %s", fnGetLoaderDiagnosticInfo ? "ACTIVE" : "NO API EXPORTS");
+                    SetTextColor(hdcMem, RGB(220, 220, 220));
+                    TextOutA(hdcMem, devX + 15, devYOffset, stateBuf, (int)strlen(stateBuf));
+                    devYOffset += g_TextFontSize + 6;
+
+                    SetTextColor(hdcMem, RGB(180, 180, 180));
+                    snprintf(stateBuf, sizeof(stateBuf), "- D3D11 Hooks: %s", d3dHooked ? "HOOKED" : "DISABLED");
+                    TextOutA(hdcMem, devX + 15, devYOffset, stateBuf, (int)strlen(stateBuf));
+                    devYOffset += g_TextFontSize + 4;
+
+                    snprintf(stateBuf, sizeof(stateBuf), "- Logging: %s (Verbose: %s)", loggingEnabled ? "ON" : "OFF", verboseLogging ? "ON" : "OFF");
+                    TextOutA(hdcMem, devX + 15, devYOffset, stateBuf, (int)strlen(stateBuf));
+                    devYOffset += g_TextFontSize + 12;
+
+                    // Plugins
+                    SetTextColor(hdcMem, RGB(255, 255, 255));
+                    TextOutA(hdcMem, devX + 15, devYOffset, "--- LOADED PLUGINS ---", 22);
+                    devYOffset += g_TextFontSize + 6;
+
+                    if (fnGetActivePluginsCount) {
+                        int pluginsCount = fnGetActivePluginsCount();
+                        if (pluginsCount == 0) {
+                            SetTextColor(hdcMem, RGB(130, 130, 130));
+                            TextOutA(hdcMem, devX + 15, devYOffset, "(No plugins loaded)", 19);
+                            devYOffset += g_TextFontSize + 4;
+                        } else {
+                            for (int p = 0; p < pluginsCount; p++) {
+                                wchar_t pName[256] = { 0 };
+                                void* baseAddr = nullptr;
+                                fnGetActivePluginInfo(p, pName, &baseAddr);
+
+                                char pInfo[128];
+                                snprintf(pInfo, sizeof(pInfo), "- %S @ 0x%p", pName, baseAddr);
+                                SetTextColor(hdcMem, RGB(200, 200, 200));
+                                TextOutA(hdcMem, devX + 15, devYOffset, pInfo, (int)strlen(pInfo));
+                                devYOffset += g_TextFontSize + 4;
+                            }
+                        }
+                    } else {
+                        SetTextColor(hdcMem, RGB(220, 100, 100));
+                        TextOutA(hdcMem, devX + 15, devYOffset, "Plugin API binding missing!", 27);
+                        devYOffset += g_TextFontSize + 4;
+                    }
+                    devYOffset += 8;
+
+                    // Mods
+                    SetTextColor(hdcMem, RGB(255, 255, 255));
+                    TextOutA(hdcMem, devX + 15, devYOffset, "--- ACTIVE MODS ORDER ---", 25);
+                    devYOffset += g_TextFontSize + 6;
+
+                    if (fnGetActiveModsCount) {
+                        int modsCount = fnGetActiveModsCount();
+                        if (modsCount == 0) {
+                            SetTextColor(hdcMem, RGB(130, 130, 130));
+                            TextOutA(hdcMem, devX + 15, devYOffset, "(No active mods)", 16);
+                            devYOffset += g_TextFontSize + 4;
+                        } else {
+                            for (int m = 0; m < modsCount; m++) {
+                                wchar_t mName[256] = { 0 };
+                                fnGetActiveModName(m, mName, 256);
+
+                                char mInfo[128];
+                                snprintf(mInfo, sizeof(mInfo), "%d. %S", m + 1, mName);
+                                SetTextColor(hdcMem, RGB(200, 200, 200));
+                                TextOutA(hdcMem, devX + 15, devYOffset, mInfo, (int)strlen(mInfo));
+                                devYOffset += g_TextFontSize + 4;
+                                if (devYOffset > devY + devHeight - 20) break;
+                            }
+                        }
+                    } else {
+                        SetTextColor(hdcMem, RGB(220, 100, 100));
+                        TextOutA(hdcMem, devX + 15, devYOffset, "Mod API binding missing!", 24);
+                        devYOffset += g_TextFontSize + 4;
+                    }
+                }
+
                 DeleteObject(hFontTitle);
                 DeleteObject(hFontText);
             }
@@ -276,6 +404,19 @@ DWORD WINAPI OverlayThread(LPVOID lpParam) {
     if (!g_OverlayRunning) {
         DebugLog("[BattleOverlay] OverlayThread stopped before window creation.\n");
         return 0;
+    }
+
+    // Bind Loader Diagnostics functions if available
+    HMODULE hLoader = GetModuleHandleA("d3d11.dll");
+    if (hLoader) {
+        fnGetActiveModsCount = (GetActiveModsCount_t)GetProcAddress(hLoader, "GetActiveModsCount");
+        fnGetActiveModName = (GetActiveModName_t)GetProcAddress(hLoader, "GetActiveModName");
+        fnGetActivePluginsCount = (GetActivePluginsCount_t)GetProcAddress(hLoader, "GetActivePluginsCount");
+        fnGetActivePluginInfo = (GetActivePluginInfo_t)GetProcAddress(hLoader, "GetActivePluginInfo");
+        fnGetLoaderDiagnosticInfo = (GetLoaderDiagnosticInfo_t)GetProcAddress(hLoader, "GetLoaderDiagnosticInfo");
+        DebugLog("[BattleOverlay] Diagnostics functions successfully bound from d3d11.dll\n");
+    } else {
+        DebugLog("[BattleOverlay] WARNING: Could not get d3d11.dll module handle for diagnostics binding.\n");
     }
 
     // Register class
@@ -327,6 +468,20 @@ DWORD WINAPI OverlayThread(LPVOID lpParam) {
                 }
             } else {
                 wasKeyDown = false;
+            }
+
+            // Check for developer diagnostics panel toggle hotkey: Ctrl + g_DeveloperHotkey
+            if (g_ShowDeveloperPanel) {
+                static bool wasDevKeyDown = false;
+                bool isDevDown = (GetAsyncKeyState(g_DeveloperHotkey) & 0x8000) != 0;
+                if (isCtrlDown && isDevDown) {
+                    if (!wasDevKeyDown) {
+                        g_DevPanelVisible = !g_DevPanelVisible;
+                        wasDevKeyDown = true;
+                    }
+                } else {
+                    wasDevKeyDown = false;
+                }
             }
         }
 

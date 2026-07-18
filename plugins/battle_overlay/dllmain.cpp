@@ -17,6 +17,8 @@ bool g_ShowEnemies = true;
 bool g_ShowATB = true;
 bool g_ShowNumericHP = false;
 bool g_ShowFPS = false;
+bool g_ShowDeveloperPanel = false;
+int g_DeveloperHotkey = 0x72;
 int g_PanelX = 10;
 int g_PanelY = 10;
 int g_PanelWidth = 510;
@@ -116,6 +118,11 @@ void LoadConfig() {
 
     GetPrivateProfileStringA("Config", "ShowFPS", "false", temp, sizeof(temp), g_IniPath);
     g_ShowFPS = ParseBool(temp, false);
+
+    GetPrivateProfileStringA("Config", "ShowDeveloperPanel", "false", temp, sizeof(temp), g_IniPath);
+    g_ShowDeveloperPanel = ParseBool(temp, false);
+
+    g_DeveloperHotkey = GetPrivateProfileIntA("Config", "DeveloperHotkey", 0x72, g_IniPath);
 
     g_PanelX = GetPrivateProfileIntA("Config", "PanelX", 10, g_IniPath);
     g_PanelY = GetPrivateProfileIntA("Config", "PanelY", 10, g_IniPath);

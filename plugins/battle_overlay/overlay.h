@@ -28,3 +28,5 @@ extern char g_FontFace[32];
 extern int g_TitleFontSize;
 extern int g_TextFontSize;
 extern bool g_ShowFPS;
+extern bool g_ShowDeveloperPanel;
+extern int g_DeveloperHotkey;

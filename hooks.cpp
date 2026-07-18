@@ -4098,3 +4098,36 @@ void HookedClearerr(FILE* stream) {
     }
     OriginalClearerr(stream);
 }
+
+// Loader Diagnostic Exports for Plugins
+extern "C" __declspec(dllexport) int GetActiveModsCount() {
+    return (int)g_ActiveMods.size();
+}
+
+extern "C" __declspec(dllexport) void GetActiveModName(int index, wchar_t* outName, int maxLen) {
+    if (index >= 0 && index < (int)g_ActiveMods.size()) {
+        wcscpy_s(outName, maxLen, g_ActiveMods[index].c_str());
+    } else {
+        if (outName && maxLen > 0) outName[0] = L'\0';
+    }
+}
+
+extern "C" __declspec(dllexport) int GetActivePluginsCount() {
+    return (int)g_ActivePlugins.size();
+}
+
+extern "C" __declspec(dllexport) void GetActivePluginInfo(int index, wchar_t* outName, void** outBaseAddress) {
+    if (index >= 0 && index < (int)g_ActivePlugins.size()) {
+        if (outName) wcscpy_s(outName, 256, g_ActivePlugins[index].c_str());
+        if (outBaseAddress) *outBaseAddress = GetModuleHandleW(g_ActivePlugins[index].c_str());
+    } else {
+        if (outName) outName[0] = L'\0';
+        if (outBaseAddress) *outBaseAddress = nullptr;
+    }
+}
+
+extern "C" __declspec(dllexport) void GetLoaderDiagnosticInfo(int* outD3DHooked, int* outLoggingEnabled, int* outVerboseLogging) {
+    if (outD3DHooked) *outD3DHooked = g_D3D11HookInitialized ? 1 : 0;
+    if (outLoggingEnabled) *outLoggingEnabled = g_EnableLogging ? 1 : 0;
+    if (outVerboseLogging) *outVerboseLogging = g_VerboseLogging ? 1 : 0;
+}
